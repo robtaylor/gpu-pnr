@@ -59,34 +59,43 @@ def _mask_polluted(d: torch.Tensor) -> torch.Tensor:
 def sweep_sssp(
     w: torch.Tensor,
     source: tuple[int, int],
-    max_iters: int = 50,
+    max_iters: int = 200,
+    check_every: int = 8,
 ) -> tuple[torch.Tensor, int]:
     """Compute shortest-path distances on a 2D grid via alternating axis sweeps.
+
+    Convergence is checked every `check_every` iterations rather than every
+    iteration -- the per-iter `torch.equal` forces a CPU<->GPU sync that
+    serialises the GPU pipeline. Checking every K iters lets K iterations
+    run async between syncs.
 
     Args:
         w: (H, W) tensor, cost to enter each cell. Use float('inf') for obstacles.
         source: (row, col) of the source cell.
         max_iters: cap on outer-loop iterations.
+        check_every: how often (in iterations) to test for convergence.
 
     Returns:
         (d, iters) where d is the (H, W) distance tensor and iters is the
-        number of outer iterations executed before convergence.
+        number of outer iterations executed.
     """
     d = torch.full_like(w, float("inf"))
     sr, sc = source
     d[sr, sc] = 0.0
 
     w_proxy = _to_proxy(w)
+    d_check = d.clone()
 
     for it in range(max_iters):
-        d_prev = d.clone()
         d = _sweep_forward(d, w_proxy, axis=1)
         d = _sweep_backward(d, w_proxy, axis=1)
         d = _sweep_forward(d, w_proxy, axis=0)
         d = _sweep_backward(d, w_proxy, axis=0)
         d = _mask_polluted(d)
-        if torch.equal(d, d_prev):
-            return d, it + 1
+        if (it + 1) % check_every == 0:
+            if torch.equal(d, d_check):
+                return d, it + 1
+            d_check = d.clone()
 
     return d, max_iters
 
