@@ -1,0 +1,21 @@
+[project]
+name = "gpu-pnr"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Rob Taylor", email = "rob.taylor@chipflow.io" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.4",
+    "pytest>=9.0.3",
+    "torch>=2.11.0",
+]
+
+[project.scripts]
+gpu-pnr = "gpu_pnr:main"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
