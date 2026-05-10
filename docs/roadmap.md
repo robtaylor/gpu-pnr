@@ -131,8 +131,15 @@ high for real per-net guides because they have ~93% obstacle density per
 row. Auto-tuning `SEG_BARRIER` from `max(seg_id_per_axis)` is the next
 natural fix and unblocks fixture work at scale.
 
+**Landed under 3.2 so far:**
+- Single-net spike (`scripts/spike_route_one_net.py`).
+- Auto-tune `SEG_BARRIER` per call (replaced the module constant; 1.5ms
+  overhead per sweep).
+- Multi-net spike (`scripts/spike_route_many_nets.py`): 500 small 2-pin
+  nets all routed end-to-end on real LibreLane data; per-net latency
+  41-50ms (kernel-launch-bound at these tiny grids).
+
 **Still TODO under 3.2:**
-- Auto-tune `SEG_BARRIER` per call.
 - Comparison harness vs `final/def/synth_top_level_3.def` (TritonRoute output).
 - Multi-pin net handling (Hazard3 has many; spike was 2-pin only).
 - Preferred routing direction (Metal1=H, Metal2=V, ...) — needed for honest

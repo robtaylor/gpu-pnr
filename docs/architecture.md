@@ -33,26 +33,39 @@ d_new = cumsum(w) + cummin(d - cumsum(w))
 which dispatches as a parallel scan on GPU rather than N sequential kernel
 launches. Backward sweep = flip → forward → flip.
 
-**Obstacle handling (Phase 3.1, mask-based segmented scan):** `cumsum` runs on
-`w_clean = where(obstacle, 0, w)` so magnitudes stay proportional to real path
-weight. A separate `seg_id = cumsum(obstacle_mask)` per axis identifies which
-segment (maximal run of non-obstacle cells) each cell belongs to. The cummin
-input is offset by `seg_id * SEG_BARRIER` (with `SEG_BARRIER = 2e4`), making
-earlier-segment values larger than current-segment values so cummin can never
-pick across a segment boundary. The offset is subtracted back exactly at the
-output. `seg_cw[j]` (cumsum-from-current-segment-start) is computed as
+**Obstacle handling (Phase 3.1, mask-based segmented scan; SEG_BARRIER
+autotuned in Phase 3.2):** `cumsum` runs on `w_clean = where(obstacle, 0, w)`
+so magnitudes stay proportional to real path weight. A separate
+`seg_id = cumsum(obstacle_mask)` per axis identifies which segment (maximal
+run of non-obstacle cells) each cell belongs to. The cummin input is offset
+by `seg_id * seg_barrier`, making earlier-segment values larger than
+current-segment values so cummin can never pick across a segment boundary.
+The offset is subtracted back exactly at the output. `seg_cw[j]`
+(cumsum-from-current-segment-start) is computed as
 `cw - cummax(cw_at_obstacle_positions)`.
 
 When an entire current segment is unreachable (`d=inf` everywhere), cummin
 falls back to the prior segment's running minimum and the reconstruction
-shifts that value by `(S-S')*SEG_BARRIER`. The result is a finite-but-large
-polluted distance, so a final `d > SEG_BARRIER/2` mask returns it to `inf`.
+shifts that value by `(S-S')*seg_barrier`. The result is a finite-but-large
+polluted distance, so a final `d > seg_barrier/2` mask returns it to `inf`.
 
-Float32 precision budget: legit distances must stay under `SEG_BARRIER/2 = 1e4`
-to avoid being falsely masked. For unit weights that means grids up to ~5000
-per side. The previous `INF_PROXY` scheme broke at ~2048 per side because
-`cumsum * N * INF_PROXY` exceeded float32 ULP for legit distances; the masked
-scheme avoids that since `cw` magnitudes are independent of obstacle count.
+**Autotuned `seg_barrier`:** the Phase 3.1 module constant `SEG_BARRIER=2e4`
+worked for synthetic 5%-obstacle-density grids but broke on real per-net
+guides with ~93% obstacle density (per-row obstacle counts of ~1000 push
+`seg_id*SEG_BARRIER` past `1.85e7` where float32 ULP corrupts distances of
+order 1000 -- see `docs/phase32_spike.md`). `_autotune_seg_barrier(w, mask)`
+in `sweep.py` picks a per-call value as the geometric mean of
+`[2*max_legit_distance, FLOAT32_PRECISION_BUDGET/max_seg_id]`. Cost: ~3 GPU
+syncs per sweep call (~1.5ms on MPS), <2% of typical sweep time. If the
+constraint range is empty (workload exceeds the float32 precision budget),
+autotune falls back to the upper bound and the polluted-mask threshold
+becomes incorrect -- documented behavior; this is what 8192^2 unit-weight
+hits.
+
+Float32 precision budget: legit distances must stay under `seg_barrier/2`.
+With autotune covering both regimes, the new wall is at grids where
+`max_legit_distance * 2 * max_seg_id > FLOAT32_PRECISION_BUDGET = 1e7`. For
+unit-weight grids that's around 8000 per side at 5% obstacle density.
 
 **Async pipelining:** Convergence is checked every `check_every=8` iterations
 (via `torch.equal`, which forces a CPU↔GPU sync) rather than per-iter. K

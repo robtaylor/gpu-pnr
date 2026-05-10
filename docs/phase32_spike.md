@@ -92,31 +92,93 @@ natural piece of work.
    to ad-hoc DEF parsing, or use OpenROAD's `odb` Python (which requires an
    OpenROAD install).
 
+## SEG_BARRIER autotune (landed)
+
+Replaced the module-constant `SEG_BARRIER=2e4` with a per-call autotune that
+derives the value from grid shape and obstacle density:
+
+```
+lower = 2 * max_legit_distance_estimate     # H+W times max_w_finite, plus L*via_cost
+upper = FLOAT32_PRECISION_BUDGET / max_seg_id   # 1e7 / max obstacle count per axis
+seg_barrier = sqrt(lower * upper)           # geometric mean of valid range
+```
+
+If `lower >= upper` the autotune falls back to `upper * 0.99` and the workload
+is documented as exceeding the float32 precision budget (this is what 8192^2
+unit-weight grids hit -- the new wall, same place Phase 3.1 documented).
+
+**Cost of the autotune:** ~3 GPU syncs per sweep call (~1.5ms on MPS):
+- one masked `max(w_finite)` reduction
+- two `cumsum(obstacle_mask) + max + .item()` per spatial axis
+At Phase 3.1's 1024^2 sweet spot of ~94ms/sweep, the autotune adds ~1.6%
+overhead. For per-net routing the autotune fires per net (each has its own
+obstacle pattern), but the per-net work itself is dominated by the
+convergence loop, so the autotune cost is in the noise.
+
+**Synthetic perf preserved:** post-autotune `bench_scaling.py` numbers are
+within run-to-run noise of the post-Phase-3.1 hoisted-precompute version
+(1024^2: 2.34 -> 2.41 ms/iter; 4096^2: 31.34 -> 32.83 ms/iter). 4096^2 still
+correct; 8192^2 still hits the precision wall (best-effort fallback).
+
+**Real-fixture perf unblocked:** `_00000_` now routes correctly with no
+manual override -- d[sink]=1364 in 16 iterations.
+
+## Multi-net spike (landed)
+
+`scripts/spike_route_many_nets.py` runs `route_nets_3d` on N independent
+2-pin nets (each with its own per-net grid built from its guide rectangles).
+Sample of the 50 smallest 2-pin nets:
+
+```
+=== Aggregate over 50 nets ===
+  routed: 50 / 50 (100.0%)
+  total wirelength: 7664 cells
+  total via transitions: 20
+  avg per-net time: 51.1 ms
+
+Layer occupancy (number of routed nets that used the layer):
+  Metal1: 50
+  Metal2: 10
+  Metal3: 0
+  Metal4: 0
+  Metal5: 0
+```
+
+Scaling to 200 and 500 nets: still 100% routed, per-net time stable at 41-45ms.
+Most short nets stay on M1 because M1 cost (1 per cell) beats via_cost (5 per
+via, 4 vias minimum to use M3 = 20 cost) for short routes. This is the
+expected cost-model behavior; preferred-direction modelling would push more
+of them off M1, which is left for the next iteration.
+
+**Per-net latency is launch-overhead-dominated** at these tiny per-net grids.
+50K Hazard3 nets at 41ms = ~35 minutes total -- comparable to TritonRoute on
+a desktop, but kernel-launch overhead would drop substantially with batching
+or `torch.compile`. The autotune's ~1.5ms is a small fraction of the per-net
+budget here.
+
 ## Next steps
 
 In rough priority order:
 
-1. **Auto-tune `SEG_BARRIER`.** The fact that a single module constant doesn't
-   fit both synthetic 4096^2 (`SEG_BARRIER=2e4` is right) and real per-net
-   guides (`SEG_BARRIER=5e3` is right) means the constant should be derived.
-   Smallest change: compute `SEG_BARRIER = 4 * max(seg_id_per_axis) ` (or
-   similar) inside `_precompute_axis`. Falls out of obstacle-density
-   automatically.
-2. **Compare to TritonRoute.** Parse the final-DR DEF, find the same net's
-   route, compare wirelength / via count / total cost. If the kernel's path
-   diverges from TritonRoute, the divergence is the *interesting* finding.
-3. **Multi-pin nets.** Pick from the ~11,000 nets with 3+ Metal1 rectangles
-   in the guide. Will probably need a router-level change (sequential
-   point-to-point construction with re-rooting).
-4. **Preferred-direction cost model.** Per-layer x-cost / y-cost split, or
-   per-axis-cost-multiplier. Probably needed for any honest TritonRoute
-   comparison on routes that span direction changes.
+1. **Compare to TritonRoute.** Parse `final/def/synth_top_level_3.def`, find
+   the same nets' actual routes, compare wirelength / via count. The
+   spike has a placeholder for this -- it's the *interesting* deliverable
+   for honest evaluation.
+2. **Multi-pin nets.** Pick from the ~11,000 nets with 3+ Metal1 rectangles
+   in the guide. Likely a router-level change (sequential point-to-point
+   construction with re-rooting, or Steiner-tree-flavored heuristic).
+3. **Preferred-direction cost model.** Per-layer x-cost / y-cost split, or
+   per-axis cost multipliers. Needed for any honest TritonRoute comparison
+   on routes that span direction changes.
+4. **Whole-chip integration.** Replace per-net mini-grids with a single
+   chip-scale grid that tracks committed routes globally. Gates on (3) and
+   probably bigger SEG_BARRIER headroom (or grid tiling -- Phase 3.3).
 
 ## Files added
 
-- `scripts/spike_route_one_net.py` -- the spike driver. Accepts a net name
-  and an optional SEG_BARRIER override.
+- `scripts/spike_route_one_net.py` -- single-net debugging driver. Accepts a
+  net name and an optional SEG_BARRIER override.
+- `scripts/spike_route_many_nets.py` -- multi-net aggregate-stats driver.
 - `docs/phase32_spike.md` -- this document.
 - `~/.claude/projects/-Users-roberttaylor-Code-gpu-pnr/memory/hazard3_fixture.md`
-  -- reference memory for the fixture location, so future sessions don't
-  rediscover it.
+  -- reference memory for the fixture location.
