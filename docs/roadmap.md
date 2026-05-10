@@ -66,27 +66,25 @@ Implement as a pluggable strategy in `route_nets` or a sibling
 Expected impact: ~10–20% wirelength improvement; modest success-rate
 improvement on top of endpoint reservation.
 
-### 2.3 Sweep-sharing (concurrent multi-source)
+### 2.3 Sweep-sharing (concurrent multi-source) — kernel done, integration deferred
 
-Adapt the 2025 ICCAD LBR "sweep-sharing" technique: route multiple nets
-concurrently in a single sweep operation by maintaining per-source distance
-buffers and propagating them in parallel. K-fold throughput gain at the cost
-of per-batch quality (nets in a shared sweep don't see each other's
-commitments yet).
+`sweep_sssp_multi(w, K-sources)` is implemented and tested: agrees with
+per-source `sweep_sssp` within float32 tolerance, and gives 3.1× speedup
+at 256² K=50.
 
-This is the **bigger lever for production scale** (10K-net designs) and
-where the actual GPU throughput story lives. Sequential routing as in Phase
-1 is fundamentally bottlenecked at 1 sweep per net.
+**But: no speedup at 1024² (~target scale).** The per-source sweep is
+memory-bandwidth-bound at that size; sharing doesn't reduce data
+movement. See `results.md` for the full table.
 
-The interaction with ordering: ordering moves up to *batch construction*
-(which nets can share a sweep without contention?) and back down to *ripup
-queue priority* (when conflicts are detected, which loser routes first?).
+This means batched-router integration (`route_nets_batched` with
+conflict detection + ripup) is deferred — it would add complexity
+without throughput gain at our scale. The kernel is kept as-is for
+the tile-decomposition path (Phase 3.4 below).
 
-Estimated effort: 1–2 weeks. Requires:
-- Per-source distance buffer (4D tensor: K × H × W or similar)
-- Multi-source initialisation
-- Conflict detection on K simultaneous backtraces
-- Ripup queue + repair loop
+**The interaction with ordering** is the same as before: ordering moves
+up to batch construction and back down to ripup queue priority. We just
+won't pay that complexity cost until tile decomposition makes the
+batching worthwhile.
 
 ## Phase 3 — PLANNED
 
@@ -119,7 +117,17 @@ ASIC routing experiment. Requires:
 - 3D / multi-layer extension of the sweep kernel (per-layer sweeps + via cost)
 - Comparison harness
 
-### 3.3 Multi-layer + via cost
+### 3.3 Tile decomposition (the path to actual sweep-sharing value)
+
+Split a 1024² (or larger) grid into 4×4 = 16 tiles of 256² each, with
+halo overlap between tiles. Within each tile, route all its nets via
+sweep-sharing (3.1× win at that grid size). At tile boundaries,
+reconcile partial routes through the halo zone. Standard parallel-
+routing partitioning, well-studied for FPGA routing.
+
+This is what unlocks Phase 2.3's sweep-sharing kernel at chip scale.
+
+### 3.4 Multi-layer + via cost
 
 The current kernel is 2D. Real ASIC routing is multi-layer with via
 transitions. Per-layer sweeps + a cross-layer via-update step. Adds a layer

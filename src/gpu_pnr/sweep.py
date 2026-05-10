@@ -100,6 +100,50 @@ def sweep_sssp(
     return d, max_iters
 
 
+def sweep_sssp_multi(
+    w: torch.Tensor,
+    sources: list[tuple[int, int]],
+    max_iters: int = 200,
+    check_every: int = 8,
+) -> tuple[torch.Tensor, int]:
+    """Compute K shortest-path distance maps from K sources concurrently.
+
+    Generalises `sweep_sssp` to a batch dim (K). Each source gets its own
+    distance map; sources in the same call do NOT see each other's wires
+    (no obstacle update between them). The intended use is throughput:
+    one multi-sweep replaces K sequential sweeps for batched routing.
+
+    Args:
+        w: (H, W) tensor of cell-entry costs.
+        sources: list of K (row, col) source pins.
+        max_iters, check_every: as in `sweep_sssp`.
+
+    Returns:
+        (d, iters) where d is (K, H, W).
+    """
+    K = len(sources)
+    H, W = w.shape
+    d = torch.full((K, H, W), float("inf"), device=w.device, dtype=w.dtype)
+    for k, (sr, sc) in enumerate(sources):
+        d[k, sr, sc] = 0.0
+
+    w_proxy = _to_proxy(w).unsqueeze(0)
+    d_check = d.clone()
+
+    for it in range(max_iters):
+        d = _sweep_forward(d, w_proxy, axis=2)
+        d = _sweep_backward(d, w_proxy, axis=2)
+        d = _sweep_forward(d, w_proxy, axis=1)
+        d = _sweep_backward(d, w_proxy, axis=1)
+        d = _mask_polluted(d)
+        if (it + 1) % check_every == 0:
+            if torch.equal(d, d_check):
+                return d, it + 1
+            d_check = d.clone()
+
+    return d, max_iters
+
+
 def backtrace(
     d: torch.Tensor,
     w: torch.Tensor,

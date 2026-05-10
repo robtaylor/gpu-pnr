@@ -83,6 +83,29 @@ def test_backtrace_valid_path():
     )
 
 
+def test_multi_source_matches_per_source():
+    torch.manual_seed(0)
+    H, W = 24, 24
+    w = torch.rand(H, W) + 0.1
+    w[10, 4:18] = math.inf
+    sources = [(0, 0), (H - 1, W - 1), (5, 12), (15, 5)]
+
+    from gpu_pnr.sweep import sweep_sssp_multi
+
+    d_multi, _ = sweep_sssp_multi(w, sources)
+    for k, src in enumerate(sources):
+        d_single, _ = sweep_sssp(w, src)
+        finite_mask = torch.isfinite(d_single)
+        diff = (d_multi[k][finite_mask] - d_single[finite_mask]).abs()
+        assert diff.max().item() < 5e-2, (
+            f"source {k}={src}: max diff {diff.max().item()}"
+        )
+        inf_mask = ~finite_mask
+        assert torch.all(torch.isinf(d_multi[k][inf_mask])), (
+            f"source {k}: multi finite where single is inf"
+        )
+
+
 def test_mps_matches_cpu_when_available():
     if not torch.backends.mps.is_available():
         return

@@ -117,6 +117,40 @@ The ordering change is ~30 lines (`gpu_pnr.ordering`) and adds zero
 algorithmic complexity. This is the kind of low-cost lever that
 sequential routing benefits from.
 
+### Phase 2.3a sweep-sharing kernel: helps only in the small-grid regime
+
+`sweep_sssp_multi(w, K-sources)` extends the scan-based sweep to a batch
+dim, computing K shortest-path distance maps in one fused pass instead
+of K sequential calls. Correctness test: agrees with per-source
+`sweep_sssp` within float32 sum-order tolerance.
+
+Throughput vs sequential, K = number of concurrent sources:
+
+| Grid | K=1 | K=10 | K=50 |
+|---|---|---|---|
+| 256² | 1.11× | 1.41× | **3.10×** |
+| 512² | 1.41× | 0.78× | 1.30× |
+| 1024² | 0.37× | 0.91× | 0.97× |
+
+Negative result at our target scale: at 1024² the per-source kernel is
+already memory-bandwidth-bound (~20 ms/source for both sequential and
+multi). Sharing the sweep doesn't reduce arithmetic and doesn't reduce
+data movement — it just moves the same memory passes into wider tensors
+that take proportionally longer.
+
+Sweep-sharing only wins when the per-source kernel is launch-bound,
+which happens at grids ≤ 256². The path to value at chip scale is
+**tile decomposition** — split the 1024² grid into 4×4=16 tiles of
+256² each, sweep-share within tile, reconcile at borders. That's a
+Phase 3 architectural change, not a Phase 2 polish.
+
+The kernel is committed because it is the right primitive for both
+tile-decomposition and (later) batched per-net routing on smaller
+sub-blocks extracted from a real fixture. But the planned Phase 2.3b
+(`route_nets_batched` with conflict detection) is **deferred** —
+without speedup at the target grid size, batched routing would just
+add complexity without gain.
+
 **The 23/50 success rate** is naive sequential routing on randomly-pre-chosen
 endpoints. Smaller workloads succeed proportionally:
 
