@@ -1,4 +1,4 @@
-# Phase 1 results
+# Phase 1 / 2 results
 
 All numbers from `scripts/bench_scaling.py` and `scripts/demo_multinet.py` on an
 Apple Silicon M-series with PyTorch 2.11 MPS. Seed 42, 5% obstacle density.
@@ -177,3 +177,65 @@ Phase 2 endpoint reservation should recover most of these.
 - **Apple Silicon unified memory is genuinely a feature**, not just a
   marketing point. `.cpu()` is metadata-only — the backtrace fix wouldn't
   work nearly as cleanly on a discrete-GPU host.
+
+# Phase 3.4 — multi-layer + via cost
+
+`sweep_sssp_3d` and `route_nets_3d` extend the kernel and router to
+operate on a `(L, H, W)` cost tensor with via transitions between
+adjacent layers. Edge model: horizontal arrival pays `w[l, r, c]`; via
+arrival pays only `via_cost`. Vias respect obstacles — neither the
+kernel nor the reference Dijkstra allow a via to land on or chain
+through a blocked cell.
+
+## What changed in the inner loop
+
+Per outer iteration, after the four intra-layer sweeps + `_mask_polluted`:
+
+```
+for l in 1..L-1:                      # upward
+    d[l] = min(d[l], d[l-1] + via_cost)
+    d[l] = where(obstacle[l], inf, d[l])
+for l in L-2..0:                      # downward
+    d[l] = min(d[l], d[l+1] + via_cost)
+    d[l] = where(obstacle[l], inf, d[l])
+```
+
+A naive cumsum-cummin scan along `axis=0` (with `via_cost * arange(L)`
+as the offset) was the first attempt — it's a single parallel pass per
+direction. **It was incorrect under obstacles**: the scan adds
+`via_cost * |Δl|` for any layer-pair regardless of intermediate
+obstructions, allowing vias to "chain through" blocked layers. The
+sequential per-layer form is correct, costs `2(L-1)` GPU min/where ops
+per iter, and is dwarfed by the four intra-layer scans for typical
+ASIC stacks (L=4-12).
+
+## Negative finding worth flagging
+
+The first thing I tried (cumsum-cummin layer scan) is the obvious
+"keep everything as a parallel scan" move and it would have been an
+attractive headline result. It happens to give the right numbers in
+test_two_layers_zero_via_collapses_to_2d_min and test_high_via, then
+fails the moment a multi-net router commits an obstacle on the
+destination layer. That's a recurring shape: the parallel-scan
+formulation tempts you with elegance and silently mis-models the very
+thing the kernel exists to handle.
+
+## Tests
+
+16 new tests across `tests/test_sweep_3d.py` (9) and
+`tests/test_router_3d.py` (7); full suite is 35/35 green.
+The single-layer 3D matches existing 2D `sweep_sssp` exactly,
+the cross-layer detour case is exercised both at the kernel level
+(distances agree with 3D Dijkstra) and the router level (a route
+forced to use a via to bypass a wall).
+
+## Performance — not yet measured
+
+No bench script for 3D yet. Per-iter cost should scale linearly with L
+(the four intra-layer sweeps run vectorised over the layer dim, costing
+the same as a single 2D sweep at `(L*H, W)` because cumsum/cummin only
+parallelise along the scan axis). Iteration count grows as the diameter
+of the 3D graph, not just the 2D one — vias contribute up to L steps
+of latency on top of the H+W horizontal diameter. Adding a 3D bench is
+left for the next session, gated on whether 3.2 (real fixture) needs
+absolute numbers or only relative speedup vs CPU.

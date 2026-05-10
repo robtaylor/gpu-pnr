@@ -86,7 +86,9 @@ up to batch construction and back down to ripup queue priority. We just
 won't pay that complexity cost until tile decomposition makes the
 batching worthwhile.
 
-## Phase 3 — PLANNED
+## Phase 3 — IN PROGRESS
+
+Phase 3.4 (multi-layer + via cost) landed first; 3.1, 3.2, 3.3 still planned.
 
 ### 3.1 Mask-based obstacle handling
 
@@ -127,12 +129,31 @@ routing partitioning, well-studied for FPGA routing.
 
 This is what unlocks Phase 2.3's sweep-sharing kernel at chip scale.
 
-### 3.4 Multi-layer + via cost
+### 3.4 Multi-layer + via cost — DONE
 
-The current kernel is 2D. Real ASIC routing is multi-layer with via
-transitions. Per-layer sweeps + a cross-layer via-update step. Adds a layer
-dimension to all tensors and modest complexity to the inner loop. Should
-not change the asymptotic GPU efficiency story.
+`sweep_sssp_3d` and `route_nets_3d` operate on a `(L, H, W)` cost tensor.
+Edge model: horizontal arrival at `(l, r, c)` pays `w[l, r, c]`; via
+arrival pays only `via_cost`. Vias respect per-layer obstacles — they
+neither land on nor chain through blocked cells.
+
+Inner loop adds two sequential per-layer min relaxations along `axis=0`
+(up then down, each followed by an obstacle re-mask) on top of the
+existing four intra-layer sweeps. A cumsum-cummin scan along `axis=0`
+was the first design choice and would have kept the layer phase a single
+parallel pass — but it lets vias chain through intermediate obstacle
+layers, so the sequential form is the correct one. Cost: `2(L-1)`
+min/where ops per outer iter, dwarfed by the four intra-layer scans
+for typical ASIC stacks (L=4-12).
+
+16 new tests; full suite 35/35 green. See [results.md](results.md) for
+the inner-loop derivation and the negative finding on the parallel scan.
+
+**What was deliberately deferred:** per-layer preferred routing direction
+(M1=H, M2=V, ...). The current scalar `w[l, r, c]` model can't express
+anisotropic edge weights; a real fixture (3.2) is the right place to
+decide whether to add per-cell direction-cost or whether to model
+preferred-direction via a via-cost surcharge for direction changes. The
+kernel as it stands treats every layer as fully 4-connected.
 
 ## Phase 4 and beyond (sketches)
 
