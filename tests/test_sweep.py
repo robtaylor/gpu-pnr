@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from gpu_pnr.baseline import dijkstra_grid
@@ -104,6 +105,26 @@ def test_multi_source_matches_per_source():
         assert torch.all(torch.isinf(d_multi[k][inf_mask])), (
             f"source {k}: multi finite where single is inf"
         )
+
+
+def test_4096sq_unit_weights_finite_far_corner():
+    """Phase 3.1: the segmented-scan replacement of INF_PROXY removes the 2048^2
+    precision wall. A 4096x4096 unit-weight open grid was the smallest case
+    that produced inf at the far corner under the old scheme; with mask-based
+    obstacles the cumsum/cummin operate on small magnitudes and the far corner
+    is reached at the expected Manhattan distance."""
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS unavailable; CPU cummin on 4096x4096 takes ~minute")
+    N = 4096
+    w = torch.ones(N, N, device="mps")
+    source = (0, 0)
+    d_sweep, _ = sweep_sssp(w, source, max_iters=400)
+    far = d_sweep[N - 1, N - 1].item()
+    assert math.isfinite(far), f"far corner should be reachable, got {far}"
+    expected = 2 * (N - 1)
+    assert abs(far - expected) < 1.0, (
+        f"far corner distance {far} differs from Manhattan {expected} by more than 1 ULP"
+    )
 
 
 def test_mps_matches_cpu_when_available():

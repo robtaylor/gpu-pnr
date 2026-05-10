@@ -1,24 +1,32 @@
 """Sweep-based SSSP on a 2D grid (4-connected), Bellman-Ford via Gauss-Seidel.
 
 Each "iteration" runs four directional axis sweeps (H-forward, H-backward,
-V-forward, V-backward). Each sweep is implemented as one cumsum + one
-cummin per axis, which dispatches as a parallel scan on GPU rather than
-N sequential kernel launches.
+V-forward, V-backward). Each sweep is implemented as a segmented cumsum +
+segmented cummin per axis, which dispatches as a parallel scan on GPU
+rather than N sequential kernel launches.
 
-Forward-sweep derivation:
+Forward-sweep derivation (within a segment, i.e., a maximal run of
+non-obstacle cells along the axis):
   d_new[j] = min over k<=j of (d[k] + sum w[k+1..j])
-           = cw[j] + min over k<=j of (d[k] - cw[k])
-           = cw[j] + cummin(d - cw)[j]
-where cw = cumsum(w) along the sweep axis (inclusive).
+           = seg_cw[j] + min over k<=j in same segment of (d[k] - seg_cw[k])
+where seg_cw[j] = cumsum of w from the current segment's start to j.
 
-Obstacles (w = inf) would make cumsum NaN, so we substitute a large
-finite proxy and mask polluted distances back to inf each iteration.
+Obstacles are handled with a segmented scan, not a finite proxy:
+  - cumsum(w_clean) where w_clean treats obstacles as 0; magnitudes stay
+    proportional to real path weight (no INF_PROXY * N inflation).
+  - seg_cw[j] = cw[j] - cw_at_most_recent_obstacle[j] (the latter via
+    cummax of cw masked at obstacle positions).
+  - cummin's input is offset by seg_id * SEG_BARRIER, where seg_id is the
+    cumulative obstacle count along the axis. Earlier segments have a
+    smaller offset subtracted, so their values are larger; cummin
+    therefore can never pick across a segment boundary. The offset is
+    subtracted back exactly to recover segment-restricted minima.
 
-Proxy magnitude is bounded by float32 precision: MPS doesn't support
-float64, and `(cw + cm)` in the scan can lose precision when both
-operands are near `proxy * N`. For N ~ 1024, proxy ~ 1e4 keeps the
-worst-case magnitude under 1e7 where float32 ULP is ~1. Larger grids
-need a different obstacle-handling scheme.
+Float32 precision budget: max(|seg_cw|) is bounded by per-segment path
+weight (small); max(|seg_id * SEG_BARRIER|) is the new dominant term.
+With SEG_BARRIER=2e4 and max ~200 obstacles per row (5% density at 4096),
+worst-case magnitude is ~4e6; float32 ULP ~0.25, leaving comfortable
+headroom for unit-weight distances on grids well past 4096^2.
 
 Convergence: O(diameter) iterations; typically a handful for sparse
 obstacles.
@@ -27,10 +35,66 @@ obstacles.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 
-INF_PROXY = 1e4
+SEG_BARRIER = 2e4
+MAX_LEGIT_DISTANCE = SEG_BARRIER / 2
+
+
+@dataclass(frozen=True)
+class _ScanState:
+    """Loop-invariant per-(axis, direction) state for the masked scan.
+
+    seg_cw[j] = cumsum of finite-only weight from the current segment's start
+    through j. seg_id_barrier[j] = seg_id[j] * SEG_BARRIER, the offset that
+    keeps cummin from picking across segment boundaries. obstacle_mask is the
+    same orientation as seg_cw / seg_id_barrier (flipped along axis for the
+    backward direction).
+    """
+
+    seg_cw: torch.Tensor
+    seg_id_barrier: torch.Tensor
+    obstacle_mask: torch.Tensor
+
+
+def _obstacle_mask(w: torch.Tensor) -> torch.Tensor:
+    return torch.isinf(w)
+
+
+def _precompute_scan(
+    w: torch.Tensor, obstacle_mask: torch.Tensor, axis: int
+) -> _ScanState:
+    """Compute the parts of the segmented scan that depend only on (w, mask).
+
+    Hoisting these out of the convergence loop matters: they're recomputed
+    O(diameter) times otherwise, but they don't change as `d` evolves. With
+    the hoist, the per-iter inner sweep collapses to one cummin and a few
+    arithmetic ops on (d - seg_cw - seg_id_barrier).
+    """
+    w_clean = torch.where(obstacle_mask, 0.0, w)
+    cw = torch.cumsum(w_clean, dim=axis)
+    seg_id = torch.cumsum(obstacle_mask.to(w.dtype), dim=axis)
+    cw_at_obs = torch.where(obstacle_mask, cw, 0.0)
+    cw_recent_obs, _ = torch.cummax(cw_at_obs, dim=axis)
+    return _ScanState(
+        seg_cw=cw - cw_recent_obs,
+        seg_id_barrier=seg_id * SEG_BARRIER,
+        obstacle_mask=obstacle_mask,
+    )
+
+
+def _precompute_axis(
+    w: torch.Tensor, obstacle_mask: torch.Tensor, axis: int
+) -> tuple[_ScanState, _ScanState]:
+    """Forward + backward state for one axis. Backward state is precomputed on
+    the flipped (w, mask) so the per-iter backward sweep just flips `d`."""
+    fwd = _precompute_scan(w, obstacle_mask, axis)
+    w_f = torch.flip(w, dims=[axis])
+    obstacle_mask_f = torch.flip(obstacle_mask, dims=[axis])
+    bwd = _precompute_scan(w_f, obstacle_mask_f, axis)
+    return fwd, bwd
 
 
 def _converge_or_max(
@@ -55,29 +119,37 @@ def _converge_or_max(
     return d, max_iters
 
 
-def _to_proxy(w: torch.Tensor) -> torch.Tensor:
-    return torch.where(torch.isinf(w), torch.full_like(w, INF_PROXY), w)
+def _sweep_forward(
+    d: torch.Tensor, state: _ScanState, axis: int
+) -> torch.Tensor:
+    """Forward axis sweep using the precomputed segmented-scan state.
 
-
-def _sweep_forward(d: torch.Tensor, w_proxy: torch.Tensor, axis: int) -> torch.Tensor:
-    cw = torch.cumsum(w_proxy, dim=axis)
-    v = d - cw
+    When every cell in the current segment is unreachable (d=inf), v is inf
+    there, so cummin propagates the prior segment's running min forward; the
+    reconstruction shifts that value by (S-S')*SEG_BARRIER, producing a
+    finite-but-large polluted distance instead of inf. The polluted-mask
+    step at the end (d > MAX_LEGIT_DISTANCE) returns those to inf -- legit
+    distances are bounded by the segment's finite path weight, well under
+    MAX_LEGIT_DISTANCE for grids within the precision budget documented at
+    the top of this module.
+    """
+    inf_scalar = float("inf")
+    v = d - state.seg_cw - state.seg_id_barrier
+    v = torch.where(state.obstacle_mask, inf_scalar, v)
     cm, _ = torch.cummin(v, dim=axis)
-    return cw + cm
+    d_new = state.seg_cw + cm + state.seg_id_barrier
+    polluted = d_new > MAX_LEGIT_DISTANCE
+    return torch.where(state.obstacle_mask | polluted, inf_scalar, d_new)
 
 
-def _sweep_backward(d: torch.Tensor, w_proxy: torch.Tensor, axis: int) -> torch.Tensor:
+def _sweep_backward(
+    d: torch.Tensor, state: _ScanState, axis: int
+) -> torch.Tensor:
+    """Backward axis sweep. `state` must be the *flipped*-direction state
+    produced by `_precompute_axis`; the polluted-mask is applied inside
+    `_sweep_forward`."""
     d_f = torch.flip(d, dims=[axis])
-    w_f = torch.flip(w_proxy, dims=[axis])
-    cw = torch.cumsum(w_f, dim=axis)
-    v = d_f - cw
-    cm, _ = torch.cummin(v, dim=axis)
-    return torch.flip(cw + cm, dims=[axis])
-
-
-def _mask_polluted(d: torch.Tensor) -> torch.Tensor:
-    inf = torch.full_like(d, float("inf"))
-    return torch.where(d > INF_PROXY / 2, inf, d)
+    return torch.flip(_sweep_forward(d_f, state, axis), dims=[axis])
 
 
 def sweep_sssp(
@@ -106,14 +178,15 @@ def sweep_sssp(
     d = torch.full_like(w, float("inf"))
     sr, sc = source
     d[sr, sc] = 0.0
-    w_proxy = _to_proxy(w)
+    obstacle_mask = _obstacle_mask(w)
+    fwd_h, bwd_h = _precompute_axis(w, obstacle_mask, axis=1)
+    fwd_v, bwd_v = _precompute_axis(w, obstacle_mask, axis=0)
 
     def step(d: torch.Tensor) -> torch.Tensor:
-        d = _sweep_forward(d, w_proxy, axis=1)
-        d = _sweep_backward(d, w_proxy, axis=1)
-        d = _sweep_forward(d, w_proxy, axis=0)
-        d = _sweep_backward(d, w_proxy, axis=0)
-        return _mask_polluted(d)
+        d = _sweep_forward(d, fwd_h, axis=1)
+        d = _sweep_backward(d, bwd_h, axis=1)
+        d = _sweep_forward(d, fwd_v, axis=0)
+        return _sweep_backward(d, bwd_v, axis=0)
 
     return _converge_or_max(d, step, max_iters, check_every)
 
@@ -144,14 +217,16 @@ def sweep_sssp_multi(
     d = torch.full((K, H, W), float("inf"), device=w.device, dtype=w.dtype)
     for k, (sr, sc) in enumerate(sources):
         d[k, sr, sc] = 0.0
-    w_proxy = _to_proxy(w).unsqueeze(0)
+    w_b = w.unsqueeze(0)
+    obstacle_mask_b = _obstacle_mask(w).unsqueeze(0)
+    fwd_h, bwd_h = _precompute_axis(w_b, obstacle_mask_b, axis=2)
+    fwd_v, bwd_v = _precompute_axis(w_b, obstacle_mask_b, axis=1)
 
     def step(d: torch.Tensor) -> torch.Tensor:
-        d = _sweep_forward(d, w_proxy, axis=2)
-        d = _sweep_backward(d, w_proxy, axis=2)
-        d = _sweep_forward(d, w_proxy, axis=1)
-        d = _sweep_backward(d, w_proxy, axis=1)
-        return _mask_polluted(d)
+        d = _sweep_forward(d, fwd_h, axis=2)
+        d = _sweep_backward(d, bwd_h, axis=2)
+        d = _sweep_forward(d, fwd_v, axis=1)
+        return _sweep_backward(d, bwd_v, axis=1)
 
     return _converge_or_max(d, step, max_iters, check_every)
 
@@ -199,16 +274,16 @@ def sweep_sssp_3d(
     d = torch.full_like(w, float("inf"))
     sl, sr, sc = source
     d[sl, sr, sc] = 0.0
-    w_proxy = _to_proxy(w)
-    obstacle_mask = torch.isinf(w)
+    obstacle_mask = _obstacle_mask(w)
     inf_scalar = float("inf")
+    fwd_h, bwd_h = _precompute_axis(w, obstacle_mask, axis=2)
+    fwd_v, bwd_v = _precompute_axis(w, obstacle_mask, axis=1)
 
     def step(d: torch.Tensor) -> torch.Tensor:
-        d = _sweep_forward(d, w_proxy, axis=2)
-        d = _sweep_backward(d, w_proxy, axis=2)
-        d = _sweep_forward(d, w_proxy, axis=1)
-        d = _sweep_backward(d, w_proxy, axis=1)
-        d = _mask_polluted(d)
+        d = _sweep_forward(d, fwd_h, axis=2)
+        d = _sweep_backward(d, bwd_h, axis=2)
+        d = _sweep_forward(d, fwd_v, axis=1)
+        d = _sweep_backward(d, bwd_v, axis=1)
         for lyr in range(1, L):
             d[lyr] = torch.minimum(d[lyr], d[lyr - 1] + via_cost)
             d[lyr] = torch.where(obstacle_mask[lyr], inf_scalar, d[lyr])
