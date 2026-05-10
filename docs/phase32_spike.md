@@ -156,29 +156,93 @@ a desktop, but kernel-launch overhead would drop substantially with batching
 or `torch.compile`. The autotune's ~1.5ms is a small fraction of the per-net
 budget here.
 
+## TritonRoute comparison (landed)
+
+The post-DR DEF (`final/def/synth_top_level_3.def`) contains TritonRoute's
+actual per-net wires + vias in the standard DEF NETS-section format. A
+~80-line ad-hoc parser (`parse_def_nets` in `scripts/_hazard3_io.py`)
+extracts per-net wirelength (sum of segment Manhattan distances) and via
+count (segments ending in `Via*` token names) in 0.3s for the full 24K-net
+design. `RECT` annotations and multi-line connection lists are handled.
+
+Hand-traced two nets to validate: `_00013_` (117 cells, 4 vias) and
+`_00000_` (1495 cells, 4 vias) match the parser exactly.
+
+Aggregate vs our `route_nets_3d` over the smallest N 2-pin nets:
+
+| Sample | Our wire | TR wire | wire ratio | Our vias | TR vias | via ratio |
+|---|---|---|---|---|---|---|
+| 50 nets | 7664 | 7180 | 1.07x | 20 | 132 | 0.15x |
+| 200 nets | 21884 | 17695 | 1.24x | 44 | 512 | 0.09x |
+| 500 nets | 48622 | 36567 | 1.33x | 70 | 1246 | 0.06x |
+
+### What this tells us
+
+1. **TritonRoute uses ~10x more vias because it pays the pin-access tax.**
+   In real gf180mcuD designs, Metal1 is reserved for intra-cell routing;
+   any inter-cell wire has to hop M1->M2 (or higher) at each pin before
+   traversing, then back down to M1 at the destination. That's at least
+   2 mandatory vias per net just for pin access. TritonRoute's average of
+   ~2.5 vias/net at the smallest 500 matches: 2 access vias + occasional
+   layer changes for routing optimization. Our router doesn't know about
+   this constraint -- it sees M1 as freely routable wire and stays there
+   whenever the guide allows. 0.4 vias/net on average is "no vias except
+   when forced by the guide topology."
+2. **Our wire ratio looks competitive (1.07x at 50 nets) but is
+   misleading.** Both ends are on M1; our straight-line on-M1 path simply
+   isn't a legal route in real ASIC routing. If we modelled pin access
+   correctly (force every net to use M2+ for the wire body), our wire
+   length would jump because the M2/M3 routes that TritonRoute takes
+   often need detours around obstacles in those layers, plus the via
+   stack itself contributes a few cells of "wire" at each end.
+3. **Wire ratio grows with sample size.** 1.07x at 50 nets to 1.33x at
+   500 nets. Larger nets have more degrees of freedom; our router
+   exploits the M1-stays-cheap loophole more aggressively at scale.
+
+### What this means for the cost model
+
+The next-priority item in this list shifts: **preferred-direction +
+M1-pin-only cost model** is now the main thing keeping the comparison
+honest, not a polish on top of "we're already close." We're not really
+within 7% of TritonRoute on wirelength -- we're 10x cheating on vias
+and the wirelength happens to be close because our tiny grids collapse
+nicely on M1.
+
+A quick test of the hypothesis: artificially set `w[layer=0, ...]` to
+some large penalty (say 50 per cell) to force the router off M1. The
+rest of the cost model stays the same. Predicted outcome: via count
+goes up to TritonRoute-like 2.5/net, wirelength goes up too, ratio
+stabilizes. That's the cheapest experiment worth running before
+committing to a per-direction cost model.
+
 ## Next steps
 
-In rough priority order:
+In rough priority order, post-comparison:
 
-1. **Compare to TritonRoute.** Parse `final/def/synth_top_level_3.def`, find
-   the same nets' actual routes, compare wirelength / via count. The
-   spike has a placeholder for this -- it's the *interesting* deliverable
-   for honest evaluation.
-2. **Multi-pin nets.** Pick from the ~11,000 nets with 3+ Metal1 rectangles
-   in the guide. Likely a router-level change (sequential point-to-point
-   construction with re-rooting, or Steiner-tree-flavored heuristic).
-3. **Preferred-direction cost model.** Per-layer x-cost / y-cost split, or
-   per-axis cost multipliers. Needed for any honest TritonRoute comparison
-   on routes that span direction changes.
+1. **M1-as-pin-access cost model.** Set M1 wire to high cost (~1000),
+   forcing routing onto M2+ except for the via stack. Re-run the
+   comparison; expect wire ratio to converge with TritonRoute's once
+   the via tax is paid honestly.
+2. **Per-layer preferred direction.** M1=H, M2=V, M3=H, ... Either as
+   per-cell direction-cost or via a "wrong direction" multiplier on
+   the wire weight. Needed before the comparison can rank ordering
+   strategies on wirelength alone.
+3. **Multi-pin nets.** Pick from the ~11,000 nets with 3+ Metal1
+   rectangles in the guide. Likely a router-level change (sequential
+   point-to-point construction with re-rooting, or Steiner-tree-flavored
+   heuristic).
 4. **Whole-chip integration.** Replace per-net mini-grids with a single
-   chip-scale grid that tracks committed routes globally. Gates on (3) and
-   probably bigger SEG_BARRIER headroom (or grid tiling -- Phase 3.3).
+   chip-scale grid that tracks committed routes globally. Gates on (1)
+   and (2) and probably tile decomposition (Phase 3.3) to fit at scale.
 
 ## Files added
 
+- `scripts/_hazard3_io.py` -- shared parsers (guides, post-DR DEF NETS) and
+  grid construction. Used by both spike scripts.
 - `scripts/spike_route_one_net.py` -- single-net debugging driver. Accepts a
   net name and an optional SEG_BARRIER override.
 - `scripts/spike_route_many_nets.py` -- multi-net aggregate-stats driver.
+  Includes TritonRoute comparison (wire-length and via count ratios).
 - `docs/phase32_spike.md` -- this document.
 - `~/.claude/projects/-Users-roberttaylor-Code-gpu-pnr/memory/hazard3_fixture.md`
   -- reference memory for the fixture location.

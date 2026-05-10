@@ -138,12 +138,21 @@ natural fix and unblocks fixture work at scale.
 - Multi-net spike (`scripts/spike_route_many_nets.py`): 500 small 2-pin
   nets all routed end-to-end on real LibreLane data; per-net latency
   41-50ms (kernel-launch-bound at these tiny grids).
+- TritonRoute comparison: post-DR DEF NETS-section parser
+  (`parse_def_nets`); aggregate per-net wire and via counts. Headline:
+  our router uses ~10x fewer vias than TritonRoute because it doesn't
+  model the pin-access constraint (M1 reserved for intra-cell routing).
+  Wire ratio looks competitive at 1.07x for the smallest 50 nets but
+  grows to 1.33x at 500 nets and is misleading anyway -- both numbers
+  are dominated by the via-tax we're not paying.
 
 **Still TODO under 3.2:**
-- Comparison harness vs `final/def/synth_top_level_3.def` (TritonRoute output).
+- M1-as-pin-access-only cost model: set M1 wire cost high (~1000) to
+  force routing onto M2+. Cheapest experiment to make the comparison
+  honest.
+- Preferred routing direction (Metal1=H, Metal2=V, ...) — needed for
+  honest wirelength comparison once vias are paid correctly.
 - Multi-pin net handling (Hazard3 has many; spike was 2-pin only).
-- Preferred routing direction (Metal1=H, Metal2=V, ...) — needed for honest
-  wirelength comparison.
 - LEF parsing (only needed when pin coords aren't inferable from Metal1
   patches; `lefdef` on PyPI is macOS-broken, so build-from-source or
   ad-hoc parser are the options).
