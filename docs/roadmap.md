@@ -88,19 +88,30 @@ batching worthwhile.
 
 ## Phase 3 — IN PROGRESS
 
-Phase 3.4 (multi-layer + via cost) landed first; 3.1, 3.2, 3.3 still planned.
+Phase 3.4 (multi-layer + via cost) landed first; 3.1 done; 3.2, 3.3 still planned.
 
-### 3.1 Mask-based obstacle handling
+### 3.1 Mask-based obstacle handling — DONE
 
-Replace the `INF_PROXY` trick with a separate `obstacle_mask` tensor that
-short-circuits propagation through blocked cells without inflating cumsum
-magnitudes. Restores full float32 dynamic range for legit distances and
-removes the 2048² precision wall.
+`INF_PROXY` is gone. The sweep now runs `cumsum(w_clean)` (obstacles=0) plus a
+parallel `seg_id` track via `cumsum(obstacle_mask)`, with the cummin input
+offset by `seg_id * SEG_BARRIER` (`SEG_BARRIER = 2e4`) so cummin can never
+pick across a segment boundary. `seg_cw[j]` (cumsum-from-current-segment-start)
+is computed as `cw - cummax(cw_at_obstacle_positions)`. A polluted-mask step
+catches the case where an entire segment is unreachable. See `docs/architecture.md`
+for the full derivation and `docs/results.md` for before/after scaling numbers.
 
-Approach: split each row/column into segments at obstacle boundaries; run
-the scan within each segment independently; recombine. Vectorisable via
-segmented-scan primitives (PyTorch doesn't have one built-in, but it's
-constructible from cumsum + reset-on-mask patterns).
+**Outcome:** the 2048² wall is gone; the new wall is between 4096² and 8192²
+because legit distances must stay under `MAX_LEGIT_DISTANCE = SEG_BARRIER/2
+= 1e4`. For unit weights that's grids up to ~5000 per side. Bumping the
+wall further is mechanical (raise `SEG_BARRIER`, re-tune threshold) but
+trades float32 ULP at intermediate products for max-distance headroom.
+
+After hoisting the loop-invariant `cumsum`/`cummax`/`seg_cw`/`seg_id_barrier`
+precompute out of the convergence loop (those depend only on `w`, not `d`),
+per-iter cost is essentially back to Phase 1 parity: 1024² is 2.34 ms/iter
+at 8.4× speedup vs CPU (Phase 1 was 2.06 ms/iter at 9.5×). The hoist also
+halves per-iter cost at 4096² (67.93 → 31.34 ms/iter) — same Phase 1
+convergence behavior, on a now-correct kernel.
 
 ### 3.2 Real-fixture integration (Hazard3 GF180MCU)
 

@@ -3,7 +3,7 @@
 All numbers from `scripts/bench_scaling.py` and `scripts/demo_multinet.py` on an
 Apple Silicon M-series with PyTorch 2.11 MPS. Seed 42, 5% obstacle density.
 
-## Single-net SSSP scaling
+## Single-net SSSP scaling (Phase 1, INF_PROXY-based)
 
 | Size | Cells | Sweep (MPS) | Iters | ms/iter | Mcells/s | Dijkstra (CPU) | Speedup | Status |
 |---|---|---|---|---|---|---|---|---|
@@ -14,25 +14,47 @@ Apple Silicon M-series with PyTorch 2.11 MPS. Seed 42, 5% obstacle density.
 | 4096² | 16.8M | 2596 ms | 104 | 24.96 | 6.5 | (skip) | — | ✗ inf |
 | 8192² | 67.1M | 14821 ms | 120 | 123.51 | 4.5 | (skip) | — | ✗ inf |
 
-### Three things this tells us
+## Single-net SSSP scaling (Phase 3.1, mask-based via SEG_BARRIER)
 
-**1. Sweet spot is 1024² (~12.7 Mcells/s, 9.5× speedup).** Throughput peaks
-there and falls off — almost certainly memory-bandwidth-bound past that point.
-Each iter touches ~5 full-grid tensors; at 4M+ cells per tensor we're bouncing
-the entire working set through M-series unified memory bandwidth (~200–400 GB/s)
-repeatedly.
+After replacing `INF_PROXY` with a true segmented scan (see `docs/architecture.md`
+and the `sweep.py` module docstring), then hoisting the loop-invariant
+`cumsum`/`cummax`/`seg_cw`/`seg_id_barrier` precompute out of the convergence
+loop:
 
-**2. Correctness fails above 2048² — the float32 INF_PROXY precision wall.**
-At 4096²+, source-to-sink cost comes back as `inf` because cumsum magnitude ×
-float32 ULP exceeds legit distance values, and the polluted-mask threshold
-catches *real* distances. Documented in `sweep.py` docstring and noted in the
-roadmap as the Phase 2 mask-based-obstacle target.
+| Size | Cells | Sweep (MPS) | Iters | ms/iter | Mcells/s | Dijkstra (CPU) | Speedup | Status |
+|---|---|---|---|---|---|---|---|---|
+| 256² | 65K | 49 ms | 24 | 2.05 | 1.3 | 44 ms | 0.90× | ✓ |
+| 512² | 262K | 43 ms | 24 | 1.78 | 6.1 | 184 ms | 4.30× | ✓ |
+| **1024²** | **1.05M** | **94 ms** | **40** | **2.34** | **11.2** | **786 ms** | **8.39×** | ✓ |
+| 2048² | 4.19M | 508 ms | 64 | 7.94 | 8.3 | 3352 ms | 6.60× | ✓ |
+| **4096²** | **16.8M** | **3259 ms** | **104** | **31.34** | **5.1** | **(skip)** | — | **✓ NEW** |
+| 8192² | 67.1M | 25402 ms | 192 | 132.30 | 2.6 | (skip) | — | ✗ inf |
 
-**3. Iteration counts scale ~linearly in N (24/24/40/64/104/120).**
-Diameter-bounded as expected for 4-connected Bellman-Ford. ms/iter scales
-~O(N²) — pure grid area. So total work is O(N³), and the GPU lead opens up
-where parallel arithmetic beats per-cell sync overhead, then closes again
-where memory bandwidth becomes the wall.
+### Three things this tells us about Phase 3.1
+
+**1. The 4096² wall is gone; the new wall is between 4096² and 8192².**
+With `SEG_BARRIER=2e4` and the polluted-mask threshold at `MAX_LEGIT_DISTANCE
+= SEG_BARRIER/2 = 1e4`, the masked sweep correctly handles grids whose max
+legit distance is under ~10,000. For unit weights that's `2*(N-1) < 10000`,
+i.e., grids up to ~5000 per side. 4096² (max distance 8190) fits comfortably;
+8192² (max distance 16384) overflows the threshold and gets falsely masked.
+Bumping the wall further is mechanical: increase `SEG_BARRIER` and re-tune
+the threshold, trading float32 ULP at intermediate values for max-distance
+headroom.
+
+**2. Per-iter cost is essentially Phase 1 parity after the precompute hoist.**
+Compare `1024² ms/iter`: Phase 1 was 2.06; first-cut Phase 3.1 was 4.06
+(~2× slowdown, expected — extra cumsum + cummax + two whers). The hoist
+moves `cumsum(w_clean)`, `cumsum(obstacle_mask)`, `cummax(cw_at_obs)`, and
+`seg_cw = cw - cw_recent_obs` out of the convergence loop (they depend on
+`w` only, not `d`), so the per-iter inner work collapses to one cummin
+plus a few arithmetic ops. Result: 1024² is now 2.34 ms/iter, 8.39×
+speedup vs CPU — within ~12% of Phase 1's 9.51× while gaining correctness
+past 2048². At 4096² the hoist halves per-iter cost (67.93 → 31.34 ms/iter).
+
+**3. Iteration count grows roughly linearly with N (24/24/40/64/104/192).**
+Same diameter-bounded behavior as Phase 1; the masked sweep has the same
+convergence properties as the proxy-based one.
 
 ## Per-iter overhead progression
 

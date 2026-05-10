@@ -33,11 +33,26 @@ d_new = cumsum(w) + cummin(d - cumsum(w))
 which dispatches as a parallel scan on GPU rather than N sequential kernel
 launches. Backward sweep = flip → forward → flip.
 
-**Obstacle handling:** `inf` weights would make `cumsum` produce NaN, so we
-substitute `INF_PROXY = 1e4` and post-mask any cell with `d > INF_PROXY/2`
-back to `inf`. The proxy magnitude is bounded by float32 ULP: MPS doesn't
-support float64, and `(cumsum + cummin)` near `proxy * N` loses precision
-when `N * proxy > ~4e6`. This caps Phase 1 at grids of ~2048 per side.
+**Obstacle handling (Phase 3.1, mask-based segmented scan):** `cumsum` runs on
+`w_clean = where(obstacle, 0, w)` so magnitudes stay proportional to real path
+weight. A separate `seg_id = cumsum(obstacle_mask)` per axis identifies which
+segment (maximal run of non-obstacle cells) each cell belongs to. The cummin
+input is offset by `seg_id * SEG_BARRIER` (with `SEG_BARRIER = 2e4`), making
+earlier-segment values larger than current-segment values so cummin can never
+pick across a segment boundary. The offset is subtracted back exactly at the
+output. `seg_cw[j]` (cumsum-from-current-segment-start) is computed as
+`cw - cummax(cw_at_obstacle_positions)`.
+
+When an entire current segment is unreachable (`d=inf` everywhere), cummin
+falls back to the prior segment's running minimum and the reconstruction
+shifts that value by `(S-S')*SEG_BARRIER`. The result is a finite-but-large
+polluted distance, so a final `d > SEG_BARRIER/2` mask returns it to `inf`.
+
+Float32 precision budget: legit distances must stay under `SEG_BARRIER/2 = 1e4`
+to avoid being falsely masked. For unit weights that means grids up to ~5000
+per side. The previous `INF_PROXY` scheme broke at ~2048 per side because
+`cumsum * N * INF_PROXY` exceeded float32 ULP for legit distances; the masked
+scheme avoids that since `cw` magnitudes are independent of obstacle count.
 
 **Async pipelining:** Convergence is checked every `check_every=8` iterations
 (via `torch.equal`, which forces a CPU↔GPU sync) rather than per-iter. K
