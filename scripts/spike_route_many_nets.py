@@ -21,9 +21,12 @@ import sys
 import time
 
 from _hazard3_io import (
+    FINAL_DEF,
     GUIDE,
     LAYER_ORDER,
+    PITCH_DBU,
     build_grid,
+    parse_def_nets,
     parse_guides,
     rect_center_to_grid,
 )
@@ -43,6 +46,10 @@ def main() -> None:
     ]
     print(f"  {len(all_nets)} total nets, {len(two_pin)} are 2-pin")
 
+    print(f"Loading TritonRoute output from {FINAL_DEF.name}...")
+    triton = parse_def_nets(FINAL_DEF)
+    print(f"  {len(triton)} TritonRoute-routed nets")
+
     # Sort by total guide-rectangle count and pick the smallest N -- keeps the
     # spike fast and avoids degenerate cases where a single net's guide spans
     # most of the chip.
@@ -52,11 +59,16 @@ def main() -> None:
 
     via_cost = 5.0
     total_routed = 0
-    total_wl = 0
+    total_wl_cells = 0
     total_vias = 0
     total_time_ms = 0.0
     route_counts_by_layer = {layer: 0 for layer in LAYER_ORDER}
     failures: list[tuple[str, str]] = []
+
+    # TritonRoute aggregate over the same nets we routed (cells, not DBU).
+    triton_total_wl_cells = 0
+    triton_total_vias = 0
+    triton_missing = 0
 
     for net_name, rects in sample:
         # Pre-routing setup can fail on malformed guides; the router itself
@@ -81,17 +93,25 @@ def main() -> None:
             failures.append((net_name, "router returned None"))
             continue
         total_routed += 1
-        total_wl += res.length
+        total_wl_cells += res.length
         via_count = sum(
             1 for (la, _, _), (lb, _, _) in zip(res.path, res.path[1:]) if la != lb
         )
         total_vias += via_count
         for lyr_idx in {p[0] for p in res.path}:
             route_counts_by_layer[LAYER_ORDER[lyr_idx]] += 1
+        if net_name in triton:
+            triton_wl_dbu, triton_vc = triton[net_name]
+            # Assumes uniform 200nm pitch across all layers (gf180mcuD); a
+            # per-layer pitch table would be needed for non-isotropic PDKs.
+            triton_total_wl_cells += triton_wl_dbu // PITCH_DBU
+            triton_total_vias += triton_vc
+        else:
+            triton_missing += 1
 
     print(f"=== Aggregate over {len(sample)} nets ===")
     print(f"  routed: {total_routed} / {len(sample)} ({100 * total_routed / len(sample):.1f}%)")
-    print(f"  total wirelength: {total_wl} cells")
+    print(f"  total wirelength: {total_wl_cells} cells")
     print(f"  total via transitions: {total_vias}")
     print(f"  avg per-net time: {total_time_ms / len(sample):.1f} ms")
     print(f"  total elapsed routing time: {total_time_ms / 1000:.2f} s")
@@ -99,6 +119,26 @@ def main() -> None:
     print("Layer occupancy (number of routed nets that used the layer):")
     for layer in LAYER_ORDER:
         print(f"  {layer}: {route_counts_by_layer[layer]}")
+
+    # Restrict comparison to nets we actually routed AND TritonRoute also has.
+    if total_routed > 0:
+        matched = total_routed - triton_missing
+        print()
+        print(f"=== TritonRoute comparison (over {matched} matched nets) ===")
+        print(f"  TritonRoute total wirelength: {triton_total_wl_cells} cells")
+        print(f"  TritonRoute total vias:       {triton_total_vias}")
+        wl_ratio = (
+            f"{total_wl_cells / triton_total_wl_cells:.2f}x"
+            if triton_total_wl_cells else "n/a"
+        )
+        via_ratio = (
+            f"{total_vias / triton_total_vias:.2f}x"
+            if triton_total_vias else "n/a"
+        )
+        print(f"  ours / TritonRoute wirelength: {wl_ratio}")
+        print(f"  ours / TritonRoute vias:       {via_ratio}")
+        if triton_missing:
+            print(f"  ({triton_missing} nets we routed had no entry in TritonRoute output -- skipped)")
 
     if failures:
         print(f"\nFailures ({len(failures)}):")

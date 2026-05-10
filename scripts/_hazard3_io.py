@@ -7,6 +7,7 @@ pre-computed LibreLane run at ~/Code/Apitronix/hazard-test (see the
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import torch
@@ -14,6 +15,10 @@ import torch
 GUIDE = Path(
     "/Users/roberttaylor/Code/Apitronix/hazard-test/hazard3/librelane/runs/"
     "RUN_2026-05-08_22-32-24/39-openroad-globalrouting/after_grt.guide"
+)
+FINAL_DEF = Path(
+    "/Users/roberttaylor/Code/Apitronix/hazard-test/hazard3/librelane/runs/"
+    "RUN_2026-05-08_22-32-24/final/def/synth_top_level_3.def"
 )
 LAYER_ORDER = ["Metal1", "Metal2", "Metal3", "Metal4", "Metal5"]
 PITCH_DBU = 200  # gf180mcuD: 0.20um wire pitch, 1 DBU = 1 nm
@@ -90,3 +95,82 @@ def rect_center_to_grid(
         (cy - origin[1]) // PITCH_DBU,
         (cx - origin[0]) // PITCH_DBU,
     )
+
+
+_COORD_RE = re.compile(r"\(\s*(-?\d+|\*)\s+(-?\d+|\*)\s*\)")
+_NET_HEADER_RE = re.compile(r"^\s*-\s+(\S+)\s")
+
+
+def parse_def_nets(def_path: Path) -> dict[str, tuple[int, int]]:
+    """Parse the NETS section of a DEF, returning per-net (wirelength_dbu, via_count).
+
+    Format reminder:
+        - net_name ( inst pin ) ( inst pin ) + USE SIGNAL
+          + ROUTED Metal3 ( x y ) ( x' y' )    <- wire segment, two coord pairs
+          NEW Metal1 ( x y ) Via1_HV           <- via, single coord + Via* token
+          NEW Metal2 ( x y ) RECT ( a b c d )  <- pin shape, ignored for wirelength
+          ...
+          ;
+
+    `*` in a coord position means "same value as the previous explicit coord
+    along that axis"; resolved against `last_x` / `last_y` carried within
+    each net's routing.
+
+    Wirelength is summed in DEF DBU (1 nm for gf180mcuD); divide by PITCH_DBU
+    to get grid cells. Via count is the number of segments whose final token
+    matches Via*.
+    """
+    text = def_path.read_text()
+    nets_start = text.find("\nNETS ")
+    nets_end = text.find("\nEND NETS")
+    if nets_start < 0 or nets_end < 0:
+        raise ValueError(f"NETS section not found in {def_path}")
+    section = text[nets_start:nets_end]
+
+    nets: dict[str, tuple[int, int]] = {}
+    cur_name: str | None = None
+    cur_wire = 0
+    cur_vias = 0
+    last_x = 0
+    last_y = 0
+
+    for line in section.splitlines():
+        m = _NET_HEADER_RE.match(line)
+        if m is not None:
+            if cur_name is not None:
+                nets[cur_name] = (cur_wire, cur_vias)
+            cur_name = m.group(1)
+            cur_wire = 0
+            cur_vias = 0
+            last_x = 0
+            last_y = 0
+            continue
+        if cur_name is None:
+            continue
+        coords = _COORD_RE.findall(line)
+        if not coords:
+            continue
+        x0_tok, y0_tok = coords[0]
+        x0 = last_x if x0_tok == "*" else int(x0_tok)
+        y0 = last_y if y0_tok == "*" else int(y0_tok)
+        last_x, last_y = x0, y0
+        # RECT lines carry a second coord pair, but it's a relative bbox
+        # (pin-shape annotation), not a wire endpoint -- skip after the anchor.
+        if "RECT" in line:
+            continue
+        if len(coords) >= 2:
+            x1_tok, y1_tok = coords[1]
+            x1 = x0 if x1_tok == "*" else int(x1_tok)
+            y1 = y0 if y1_tok == "*" else int(y1_tok)
+            cur_wire += abs(x1 - x0) + abs(y1 - y0)
+            last_x, last_y = x1, y1
+        else:
+            # Last segment of a net ends with ";", strip before via-name check.
+            tokens = line.rstrip(" ;").split()
+            if tokens and tokens[-1].startswith("Via"):
+                cur_vias += 1
+
+    if cur_name is not None:
+        nets[cur_name] = (cur_wire, cur_vias)
+    return nets
+
