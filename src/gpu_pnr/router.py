@@ -1,4 +1,4 @@
-"""Sequential multi-net routing on a 2D grid.
+"""Sequential multi-net routing on 2D and 3D (multi-layer) grids.
 
 Reserves all pin cells (sources + sinks of every net) as obstacles before
 routing starts; temporarily un-reserves a net's own pins while it routes.
@@ -9,6 +9,9 @@ A net's path cells (including its endpoints, which become wires once
 routed) are committed to a separate `routed_cells` set. Once a cell is
 in that set we never un-reserve it -- two nets touching the same wire
 would be an electrical short.
+
+The 3D variant treats (layer, row, col) as the cell coordinate; pins on
+different layers at the same (row, col) are distinct cells.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from dataclasses import dataclass
 
 import torch
 
-from gpu_pnr.sweep import backtrace, sweep_sssp
+from gpu_pnr.sweep import backtrace, backtrace_3d, sweep_sssp, sweep_sssp_3d
 
 
 @dataclass
@@ -35,7 +38,22 @@ class NetResult:
         return len(self.path) - 1 if self.path else 0
 
 
-def _is_finite(w: torch.Tensor, ij: tuple[int, int]) -> bool:
+@dataclass
+class Net3DResult:
+    source: tuple[int, int, int]
+    sink: tuple[int, int, int]
+    path: list[tuple[int, int, int]] | None
+
+    @property
+    def routed(self) -> bool:
+        return self.path is not None
+
+    @property
+    def length(self) -> int:
+        return len(self.path) - 1 if self.path else 0
+
+
+def _is_finite(w: torch.Tensor, ij: tuple[int, ...]) -> bool:
     return bool(torch.isfinite(w[ij]).item())
 
 
@@ -97,5 +115,68 @@ def route_nets(
             w_cur[sink] = inf_val
 
         results.append(NetResult(source, sink, path))
+
+    return results
+
+
+def route_nets_3d(
+    w: torch.Tensor,
+    nets: list[tuple[tuple[int, int, int], tuple[int, int, int]]],
+    via_cost: float = 1.0,
+    reserve_pins: bool = True,
+) -> list[Net3DResult]:
+    """Route nets sequentially on a multi-layer grid with via transitions.
+
+    Args:
+        w: (L, H, W) tensor of cell-entry costs. inf for obstacles.
+        nets: ordered list of ((layer, row, col), (layer, row, col)) pairs.
+        via_cost: edge weight for one via transition between adjacent layers.
+        reserve_pins: if True, all pin cells (across all layers) are reserved
+            as obstacles before routing; each net's own pins are temporarily
+            un-reserved while it routes.
+
+    Returns:
+        list of Net3DResult in input order.
+    """
+    inf_val = torch.tensor(float("inf"), device=w.device, dtype=w.dtype)
+    w_cur = w.clone()
+    routed_cells: set[tuple[int, int, int]] = set()
+
+    if reserve_pins:
+        pin_cells: set[tuple[int, int, int]] = set()
+        for s, t in nets:
+            pin_cells.add(s)
+            pin_cells.add(t)
+        for ijk in pin_cells:
+            if _is_finite(w_cur, ijk):
+                w_cur[ijk] = inf_val
+
+    results: list[Net3DResult] = []
+    for source, sink in nets:
+        if source in routed_cells or sink in routed_cells:
+            results.append(Net3DResult(source, sink, None))
+            continue
+        if not _is_finite(w, source) or not _is_finite(w, sink):
+            results.append(Net3DResult(source, sink, None))
+            continue
+
+        if reserve_pins:
+            w_cur[source] = w[source]
+            w_cur[sink] = w[sink]
+
+        d, _ = sweep_sssp_3d(w_cur, source, via_cost=via_cost)
+        path = backtrace_3d(
+            d.cpu(), w_cur.cpu(), source, sink, via_cost=via_cost
+        )
+
+        if path is not None:
+            for ijk in path:
+                w_cur[ijk] = inf_val
+                routed_cells.add(ijk)
+        elif reserve_pins:
+            w_cur[source] = inf_val
+            w_cur[sink] = inf_val
+
+        results.append(Net3DResult(source, sink, path))
 
     return results

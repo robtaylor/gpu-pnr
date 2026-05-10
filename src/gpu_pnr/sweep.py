@@ -26,9 +26,33 @@ obstacles.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 INF_PROXY = 1e4
+
+
+def _converge_or_max(
+    d: torch.Tensor,
+    body: Callable[[torch.Tensor], torch.Tensor],
+    max_iters: int,
+    check_every: int,
+) -> tuple[torch.Tensor, int]:
+    """Iterate `body(d)` until fixed point or `max_iters`, checking every K.
+
+    Reuses `d_check`'s storage via in-place `copy_` instead of cloning each
+    check, since `d` itself is reassigned to a fresh tensor every iteration
+    (the sweep helpers return new tensors) -- only `d_check` needs persistence.
+    """
+    d_check = d.clone()
+    for it in range(max_iters):
+        d = body(d)
+        if (it + 1) % check_every == 0:
+            if torch.equal(d, d_check):
+                return d, it + 1
+            d_check.copy_(d)
+    return d, max_iters
 
 
 def _to_proxy(w: torch.Tensor) -> torch.Tensor:
@@ -82,22 +106,16 @@ def sweep_sssp(
     d = torch.full_like(w, float("inf"))
     sr, sc = source
     d[sr, sc] = 0.0
-
     w_proxy = _to_proxy(w)
-    d_check = d.clone()
 
-    for it in range(max_iters):
+    def step(d: torch.Tensor) -> torch.Tensor:
         d = _sweep_forward(d, w_proxy, axis=1)
         d = _sweep_backward(d, w_proxy, axis=1)
         d = _sweep_forward(d, w_proxy, axis=0)
         d = _sweep_backward(d, w_proxy, axis=0)
-        d = _mask_polluted(d)
-        if (it + 1) % check_every == 0:
-            if torch.equal(d, d_check):
-                return d, it + 1
-            d_check = d.clone()
+        return _mask_polluted(d)
 
-    return d, max_iters
+    return _converge_or_max(d, step, max_iters, check_every)
 
 
 def sweep_sssp_multi(
@@ -126,22 +144,80 @@ def sweep_sssp_multi(
     d = torch.full((K, H, W), float("inf"), device=w.device, dtype=w.dtype)
     for k, (sr, sc) in enumerate(sources):
         d[k, sr, sc] = 0.0
-
     w_proxy = _to_proxy(w).unsqueeze(0)
-    d_check = d.clone()
 
-    for it in range(max_iters):
+    def step(d: torch.Tensor) -> torch.Tensor:
+        d = _sweep_forward(d, w_proxy, axis=2)
+        d = _sweep_backward(d, w_proxy, axis=2)
+        d = _sweep_forward(d, w_proxy, axis=1)
+        d = _sweep_backward(d, w_proxy, axis=1)
+        return _mask_polluted(d)
+
+    return _converge_or_max(d, step, max_iters, check_every)
+
+
+def sweep_sssp_3d(
+    w: torch.Tensor,
+    source: tuple[int, int, int],
+    via_cost: float = 1.0,
+    max_iters: int = 200,
+    check_every: int = 8,
+) -> tuple[torch.Tensor, int]:
+    """Compute shortest-path distances on a multi-layer grid via sweep iteration.
+
+    Each layer is 4-connected for horizontal wires; adjacent layers connect at
+    the same (r, c) via an edge of weight `via_cost` (a via). Within a layer,
+    obstacles are float('inf') in `w`. Vias are unobstructed and have constant
+    cost regardless of (r, c) -- a deliberate simplification of real ASIC
+    via cells (which can be DRC-blocked).
+
+    Edge model: arrival at (l, r, c) horizontally pays w[l, r, c]; arrival via
+    a via pays only `via_cost` (the destination cell's w is not also charged).
+
+    Per iteration:
+        1. Four intra-layer sweeps (axis=2 fwd/bwd, axis=1 fwd/bwd).
+           Vectorised over L: every layer is scanned in parallel.
+        2. Mask INF_PROXY pollution back to inf.
+        3. Sequential per-layer min relaxation along axis=0 (up then down).
+           Each step is `d[l] = min(d[l], d[l-1] + via_cost)` followed by an
+           obstacle re-mask so via paths neither land on nor chain through
+           blocked cells. A naive cumsum-cummin scan along axis=0 would let
+           vias "pass through" intermediate obstacles by adding via_cost*|dl|
+           regardless of whether those cells exist; the sequential form costs
+           2(L-1) min/where ops per iter and is correct under obstacles.
+
+    Args:
+        w: (L, H, W) tensor, cost to enter each cell. inf for obstacles.
+        source: (layer, row, col).
+        via_cost: edge weight for one via transition between adjacent layers.
+        max_iters, check_every: as in `sweep_sssp`.
+
+    Returns:
+        (d, iters) where d is the (L, H, W) distance tensor.
+    """
+    L = w.shape[0]
+    d = torch.full_like(w, float("inf"))
+    sl, sr, sc = source
+    d[sl, sr, sc] = 0.0
+    w_proxy = _to_proxy(w)
+    obstacle_mask = torch.isinf(w)
+    inf_scalar = float("inf")
+
+    def step(d: torch.Tensor) -> torch.Tensor:
         d = _sweep_forward(d, w_proxy, axis=2)
         d = _sweep_backward(d, w_proxy, axis=2)
         d = _sweep_forward(d, w_proxy, axis=1)
         d = _sweep_backward(d, w_proxy, axis=1)
         d = _mask_polluted(d)
-        if (it + 1) % check_every == 0:
-            if torch.equal(d, d_check):
-                return d, it + 1
-            d_check = d.clone()
+        for lyr in range(1, L):
+            d[lyr] = torch.minimum(d[lyr], d[lyr - 1] + via_cost)
+            d[lyr] = torch.where(obstacle_mask[lyr], inf_scalar, d[lyr])
+        for lyr in range(L - 2, -1, -1):
+            d[lyr] = torch.minimum(d[lyr], d[lyr + 1] + via_cost)
+            d[lyr] = torch.where(obstacle_mask[lyr], inf_scalar, d[lyr])
+        return d
 
-    return d, max_iters
+    return _converge_or_max(d, step, max_iters, check_every)
 
 
 def backtrace(
@@ -175,6 +251,59 @@ def backtrace(
                 if abs(d[ni, nj].item() - target) <= atol:
                     path.append((ni, nj))
                     cur_i, cur_j = ni, nj
+                    moved = True
+                    break
+        if not moved:
+            return None
+
+    path.reverse()
+    return path
+
+
+def backtrace_3d(
+    d: torch.Tensor,
+    w: torch.Tensor,
+    source: tuple[int, int, int],
+    sink: tuple[int, int, int],
+    via_cost: float = 1.0,
+    atol: float = 1e-5,
+) -> list[tuple[int, int, int]] | None:
+    """Reconstruct a shortest 3D path from source to sink.
+
+    At each step, prefer in-layer 4-neighbors (predecessor distance must equal
+    d[cur] - w[cur]); fall back to cross-layer via neighbors at the same (r, c)
+    on the layer above or below (predecessor distance = d[cur] - via_cost).
+    """
+    sl, sr, sc = source
+    tl, ti, tj = sink
+    L, H, W = d.shape
+
+    if not torch.isfinite(d[tl, ti, tj]):
+        return None
+
+    path: list[tuple[int, int, int]] = [(tl, ti, tj)]
+    cur_l, cur_i, cur_j = tl, ti, tj
+
+    while (cur_l, cur_i, cur_j) != (sl, sr, sc):
+        in_layer_target = (d[cur_l, cur_i, cur_j] - w[cur_l, cur_i, cur_j]).item()
+        via_target = (d[cur_l, cur_i, cur_j] - via_cost).item()
+        moved = False
+        for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ni, nj = cur_i + di, cur_j + dj
+            if 0 <= ni < H and 0 <= nj < W and torch.isfinite(d[cur_l, ni, nj]):
+                if abs(d[cur_l, ni, nj].item() - in_layer_target) <= atol:
+                    path.append((cur_l, ni, nj))
+                    cur_i, cur_j = ni, nj
+                    moved = True
+                    break
+        if moved:
+            continue
+        for dl in (-1, 1):
+            nl = cur_l + dl
+            if 0 <= nl < L and torch.isfinite(d[nl, cur_i, cur_j]):
+                if abs(d[nl, cur_i, cur_j].item() - via_target) <= atol:
+                    path.append((nl, cur_i, cur_j))
+                    cur_l = nl
                     moved = True
                     break
         if not moved:
