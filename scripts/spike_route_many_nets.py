@@ -6,12 +6,16 @@ This isolates per-net behavior and avoids the cross-net interference the full
 chip-scale router will eventually need to handle. The autotune picks a
 SEG_BARRIER appropriate to each net's geometry.
 
-Reports aggregate stats: routed-fraction, total wirelength, total vias,
-per-net time. No comparison to TritonRoute yet -- that's separate work
-(parsing the post-DR DEF for actual routes).
+Reports aggregate stats including a comparison to TritonRoute's wire and
+via counts (parsed from final/def/...).
 
-Run: uv run python scripts/spike_route_many_nets.py [N] [SEED]
-  N defaults to 50, SEED defaults to 0.
+The optional `m1_cost` argument multiplies the cost of every Metal1 wire
+cell by that penalty. With m1_cost >> 1 the router avoids using M1 as
+through-wire and instead via-stacks from each pin up to M2+ for the wire
+body -- approximating gf180mcuD's pin-access-only convention for M1.
+
+Run: uv run python scripts/spike_route_many_nets.py [N] [SEED] [M1_COST]
+  N defaults to 50, SEED defaults to 0, M1_COST defaults to 1.0.
 """
 
 from __future__ import annotations
@@ -19,6 +23,8 @@ from __future__ import annotations
 import random
 import sys
 import time
+
+import torch
 
 from _hazard3_io import (
     FINAL_DEF,
@@ -36,7 +42,10 @@ from gpu_pnr.router import route_nets_3d
 def main() -> None:
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 50
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    m1_cost = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
     random.seed(seed)
+    if m1_cost != 1.0:
+        print(f"M1 wire-cost penalty: {m1_cost}x  (pin-access-only approximation)")
 
     print(f"Loading guides from {GUIDE.name}...")
     all_nets = parse_guides(GUIDE)
@@ -78,6 +87,14 @@ def main() -> None:
         # routing is a real bug we want to see.
         try:
             w, origin = build_grid(rects)
+            if m1_cost != 1.0:
+                # Apply pin-access-only penalty on M1 wire cells. Source/sink
+                # land on M1 too, but Phase 3.4's edge model doesn't charge
+                # w[dest] on a via arrival, so via-stacking off M1 to M2+ for
+                # the wire body and back down at the sink is the natural
+                # behavior with this penalty.
+                m1 = w[0]
+                w[0] = torch.where(torch.isinf(m1), m1, m1 * m1_cost)
             metal1 = [r for r in rects if r[4] == "Metal1"]
             source = rect_center_to_grid(metal1[0], origin)
             sink = rect_center_to_grid(metal1[1], origin)
