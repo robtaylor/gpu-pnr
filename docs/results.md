@@ -63,9 +63,38 @@ Earlier this was 815 ms/net; the fix was running `backtrace` on a `.cpu()`
 view to avoid per-cell `.item()` sync (cheap on Apple Silicon's unified
 memory).
 
-**The 23/50 success rate** is a real result, not a bug: naive sequential
-routing on randomly-pre-chosen endpoints fails when later nets find their
-pins overrun by earlier nets' paths. Smaller workloads succeed proportionally:
+### Phase 2.1 endpoint reservation: a useful negative result
+
+I expected pin reservation (mark all sources/sinks as obstacles up-front,
+temporarily un-reserve a net's own pins while it routes) to recover the
+27/50 failures by stopping early nets from running through later nets'
+pins. **It did not.** Measurements at 256² with 50 nets, seed 42:
+
+| nets | naive | reserved |
+|---|---|---|
+| 5 | 4/5 | 5/5 |
+| 10 | 9/10 | 9/10 |
+| 20 | 14/20 | 11/20 |
+| 30 | 19/30 | 15/30 |
+| 50 | 23/50 | 23/50 |
+| 80 | 26/80 | 26/80 |
+
+Reservation is a *correctness invariant* (no two distinct nets share a
+wire — the naive version violated this by chance) but is **not** a
+success-rate optimization on random workloads. Mechanism: reserving all
+pins forces early nets to take longer paths around other-pin obstacles,
+and those longer paths create more barriers that block later nets.
+
+In-isolation control: every individual net is routable on the empty
+grid (20/20). The failures are pure sequential-routing interference,
+not anything about the kernel.
+
+**Implication**: net ordering (Phase 2.2) and sweep-sharing /
+ripup-and-reroute (Phase 2.3) are load-bearing for actual success rate,
+not polish on top of reservation.
+
+**The 23/50 success rate** is naive sequential routing on randomly-pre-chosen
+endpoints. Smaller workloads succeed proportionally:
 
 | Nets | Routed |
 |---|---|

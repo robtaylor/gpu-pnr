@@ -77,3 +77,22 @@ def test_unrouteable_returns_none_without_corrupting_state():
     results = route_nets(w, nets)
     assert results[0].path is None
     assert results[1].routed
+
+
+def test_reservation_protects_other_nets_pins():
+    w = torch.ones(5, 5)
+    nets = [((0, 2), (4, 2)), ((2, 2), (0, 4))]
+
+    no_res = route_nets(w, nets, reserve_pins=False)
+    assert no_res[0].routed
+    assert no_res[1].path is None
+
+    with_res = route_nets(w, nets, reserve_pins=True)
+    assert with_res[0].routed
+    assert with_res[1].routed
+    p0, p1 = with_res[0].path, with_res[1].path
+    assert p0 is not None and p1 is not None
+    assert (2, 2) not in p0
+    assert (0, 4) not in p0
+    assert (0, 2) not in p1
+    assert (4, 2) not in p1
