@@ -39,8 +39,7 @@ from dataclasses import dataclass
 
 import torch
 
-SEG_BARRIER = 2e4
-MAX_LEGIT_DISTANCE = SEG_BARRIER / 2
+FLOAT32_PRECISION_BUDGET = 1e7  # ULP at 1e7 is ~0.6; safe headroom for autotune
 
 
 @dataclass(frozen=True)
@@ -48,23 +47,76 @@ class _ScanState:
     """Loop-invariant per-(axis, direction) state for the masked scan.
 
     seg_cw[j] = cumsum of finite-only weight from the current segment's start
-    through j. seg_id_barrier[j] = seg_id[j] * SEG_BARRIER, the offset that
+    through j. seg_id_barrier[j] = seg_id[j] * seg_barrier, the offset that
     keeps cummin from picking across segment boundaries. obstacle_mask is the
     same orientation as seg_cw / seg_id_barrier (flipped along axis for the
-    backward direction).
+    backward direction). seg_barrier is carried so _sweep_forward can compute
+    the polluted-mask threshold (= seg_barrier / 2) without a module global.
     """
 
     seg_cw: torch.Tensor
     seg_id_barrier: torch.Tensor
     obstacle_mask: torch.Tensor
+    seg_barrier: float
 
 
 def _obstacle_mask(w: torch.Tensor) -> torch.Tensor:
     return torch.isinf(w)
 
 
+def _autotune_seg_barrier(
+    w: torch.Tensor, obstacle_mask: torch.Tensor, via_cost: float = 0.0
+) -> float:
+    """Pick SEG_BARRIER from grid shape and obstacle distribution.
+
+    Constraints (see docs/architecture.md and phase32_spike.md):
+      lower: SEG_BARRIER > 2 * max_legit_distance
+        (so polluted-mask threshold = SEG_BARRIER/2 cleanly separates legit
+         distances from cross-segment pollution shifted by SEG_BARRIER).
+      upper: SEG_BARRIER * max_seg_id < FLOAT32_PRECISION_BUDGET
+        (so float32 ULP at the seg_id*SEG_BARRIER product stays well below 1
+         and doesn't corrupt distances during the cummin reconstruction).
+
+    Synthetic 4096^2 grids with 5% obstacles want SEG_BARRIER ~2e4; real
+    per-net guides with ~93% obstacle density want ~5e3. A single module
+    constant can't cover both -- this function picks the geometric mean of
+    the valid range for the actual grid being routed.
+
+    Cost: 1 cumsum-along-each-spatial-axis + 1 max + 1 sync per axis, plus 1
+    masked max(w_finite) + 1 sync. ~3 syncs total at ~0.5ms each on MPS.
+    """
+    max_w_finite = max(float(torch.where(obstacle_mask, 0.0, w).max().item()), 1.0)
+    spatial_dims = w.shape[-2:]
+    layer_dim = w.shape[0] if w.ndim == 3 else 1
+    max_legit_hint = sum(spatial_dims) * max_w_finite + layer_dim * via_cost
+
+    # max_seg_id is the largest cumulative obstacle count along any axis; since
+    # cumsum is non-decreasing, max(cumsum(mask, axis)) == max(sum(mask, axis)).
+    # Using sum instead of cumsum avoids an O(N) GPU pass and the temp alloc.
+    max_seg_id = 0
+    for axis in range(w.ndim - 2, w.ndim):
+        max_seg_id = max(
+            max_seg_id, int(obstacle_mask.sum(dim=axis).max().item())
+        )
+    if max_seg_id == 0:
+        return 2.0 * max_legit_hint + 1.0
+    upper = FLOAT32_PRECISION_BUDGET / max_seg_id
+    lower = 2.0 * max_legit_hint
+    if lower >= upper:
+        # Workload exceeds the float32 precision budget; the polluted-mask is
+        # going to false-positive on legit distances. Pick a hair below the
+        # upper bound (1% headroom) so we don't bake a value at exactly the
+        # ULP boundary and to keep the failure mode "some legit cells go inf"
+        # rather than "wrong distances on cells just below the threshold."
+        return upper * 0.99
+    return (lower * upper) ** 0.5
+
+
 def _precompute_scan(
-    w: torch.Tensor, obstacle_mask: torch.Tensor, axis: int
+    w: torch.Tensor,
+    obstacle_mask: torch.Tensor,
+    axis: int,
+    seg_barrier: float,
 ) -> _ScanState:
     """Compute the parts of the segmented scan that depend only on (w, mask).
 
@@ -80,20 +132,24 @@ def _precompute_scan(
     cw_recent_obs, _ = torch.cummax(cw_at_obs, dim=axis)
     return _ScanState(
         seg_cw=cw - cw_recent_obs,
-        seg_id_barrier=seg_id * SEG_BARRIER,
+        seg_id_barrier=seg_id * seg_barrier,
         obstacle_mask=obstacle_mask,
+        seg_barrier=seg_barrier,
     )
 
 
 def _precompute_axis(
-    w: torch.Tensor, obstacle_mask: torch.Tensor, axis: int
+    w: torch.Tensor,
+    obstacle_mask: torch.Tensor,
+    axis: int,
+    seg_barrier: float,
 ) -> tuple[_ScanState, _ScanState]:
     """Forward + backward state for one axis. Backward state is precomputed on
     the flipped (w, mask) so the per-iter backward sweep just flips `d`."""
-    fwd = _precompute_scan(w, obstacle_mask, axis)
+    fwd = _precompute_scan(w, obstacle_mask, axis, seg_barrier)
     w_f = torch.flip(w, dims=[axis])
     obstacle_mask_f = torch.flip(obstacle_mask, dims=[axis])
-    bwd = _precompute_scan(w_f, obstacle_mask_f, axis)
+    bwd = _precompute_scan(w_f, obstacle_mask_f, axis, seg_barrier)
     return fwd, bwd
 
 
@@ -126,19 +182,18 @@ def _sweep_forward(
 
     When every cell in the current segment is unreachable (d=inf), v is inf
     there, so cummin propagates the prior segment's running min forward; the
-    reconstruction shifts that value by (S-S')*SEG_BARRIER, producing a
+    reconstruction shifts that value by (S-S')*seg_barrier, producing a
     finite-but-large polluted distance instead of inf. The polluted-mask
-    step at the end (d > MAX_LEGIT_DISTANCE) returns those to inf -- legit
-    distances are bounded by the segment's finite path weight, well under
-    MAX_LEGIT_DISTANCE for grids within the precision budget documented at
-    the top of this module.
+    step (d > seg_barrier/2) returns those to inf -- legit distances are
+    bounded by the segment's finite path weight, well under seg_barrier/2
+    once seg_barrier has been picked by the autotune.
     """
     inf_scalar = float("inf")
     v = d - state.seg_cw - state.seg_id_barrier
     v = torch.where(state.obstacle_mask, inf_scalar, v)
     cm, _ = torch.cummin(v, dim=axis)
     d_new = state.seg_cw + cm + state.seg_id_barrier
-    polluted = d_new > MAX_LEGIT_DISTANCE
+    polluted = d_new > state.seg_barrier / 2
     return torch.where(state.obstacle_mask | polluted, inf_scalar, d_new)
 
 
@@ -157,6 +212,7 @@ def sweep_sssp(
     source: tuple[int, int],
     max_iters: int = 200,
     check_every: int = 8,
+    seg_barrier: float | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Compute shortest-path distances on a 2D grid via alternating axis sweeps.
 
@@ -170,6 +226,8 @@ def sweep_sssp(
         source: (row, col) of the source cell.
         max_iters: cap on outer-loop iterations.
         check_every: how often (in iterations) to test for convergence.
+        seg_barrier: optional override for the segmented-scan barrier constant.
+            Default None auto-tunes from grid shape and obstacle density.
 
     Returns:
         (d, iters) where d is the (H, W) distance tensor and iters is the
@@ -179,8 +237,10 @@ def sweep_sssp(
     sr, sc = source
     d[sr, sc] = 0.0
     obstacle_mask = _obstacle_mask(w)
-    fwd_h, bwd_h = _precompute_axis(w, obstacle_mask, axis=1)
-    fwd_v, bwd_v = _precompute_axis(w, obstacle_mask, axis=0)
+    if seg_barrier is None:
+        seg_barrier = _autotune_seg_barrier(w, obstacle_mask)
+    fwd_h, bwd_h = _precompute_axis(w, obstacle_mask, axis=1, seg_barrier=seg_barrier)
+    fwd_v, bwd_v = _precompute_axis(w, obstacle_mask, axis=0, seg_barrier=seg_barrier)
 
     def step(d: torch.Tensor) -> torch.Tensor:
         d = _sweep_forward(d, fwd_h, axis=1)
@@ -196,6 +256,7 @@ def sweep_sssp_multi(
     sources: list[tuple[int, int]],
     max_iters: int = 200,
     check_every: int = 8,
+    seg_barrier: float | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Compute K shortest-path distance maps from K sources concurrently.
 
@@ -217,10 +278,13 @@ def sweep_sssp_multi(
     d = torch.full((K, H, W), float("inf"), device=w.device, dtype=w.dtype)
     for k, (sr, sc) in enumerate(sources):
         d[k, sr, sc] = 0.0
+    obstacle_mask = _obstacle_mask(w)
+    if seg_barrier is None:
+        seg_barrier = _autotune_seg_barrier(w, obstacle_mask)
     w_b = w.unsqueeze(0)
-    obstacle_mask_b = _obstacle_mask(w).unsqueeze(0)
-    fwd_h, bwd_h = _precompute_axis(w_b, obstacle_mask_b, axis=2)
-    fwd_v, bwd_v = _precompute_axis(w_b, obstacle_mask_b, axis=1)
+    obstacle_mask_b = obstacle_mask.unsqueeze(0)
+    fwd_h, bwd_h = _precompute_axis(w_b, obstacle_mask_b, axis=2, seg_barrier=seg_barrier)
+    fwd_v, bwd_v = _precompute_axis(w_b, obstacle_mask_b, axis=1, seg_barrier=seg_barrier)
 
     def step(d: torch.Tensor) -> torch.Tensor:
         d = _sweep_forward(d, fwd_h, axis=2)
@@ -237,6 +301,7 @@ def sweep_sssp_3d(
     via_cost: float = 1.0,
     max_iters: int = 200,
     check_every: int = 8,
+    seg_barrier: float | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Compute shortest-path distances on a multi-layer grid via sweep iteration.
 
@@ -276,8 +341,10 @@ def sweep_sssp_3d(
     d[sl, sr, sc] = 0.0
     obstacle_mask = _obstacle_mask(w)
     inf_scalar = float("inf")
-    fwd_h, bwd_h = _precompute_axis(w, obstacle_mask, axis=2)
-    fwd_v, bwd_v = _precompute_axis(w, obstacle_mask, axis=1)
+    if seg_barrier is None:
+        seg_barrier = _autotune_seg_barrier(w, obstacle_mask, via_cost=via_cost)
+    fwd_h, bwd_h = _precompute_axis(w, obstacle_mask, axis=2, seg_barrier=seg_barrier)
+    fwd_v, bwd_v = _precompute_axis(w, obstacle_mask, axis=1, seg_barrier=seg_barrier)
 
     def step(d: torch.Tensor) -> torch.Tensor:
         d = _sweep_forward(d, fwd_h, axis=2)
