@@ -147,12 +147,16 @@ natural fix and unblocks fixture work at scale.
   are dominated by the via-tax we're not paying.
 
 **Still TODO under 3.2:**
-- M1-as-pin-access-only cost model: set M1 wire cost high (~1000) to
-  force routing onto M2+. Cheapest experiment to make the comparison
-  honest.
-- Preferred routing direction (Metal1=H, Metal2=V, ...) — needed for
-  honest wirelength comparison once vias are paid correctly.
+- M1-as-pin-access experiment landed (an `m1_cost` CLI knob on the
+  multi-net spike). With `m1_cost=10`, via ratio jumps from 0.15x to
+  0.76x of TritonRoute's count, saturating beyond that. The remaining
+  ~20% via deficit and the sample-size-dependent wire-ratio drift
+  (1.08x at 50 nets to 1.36x at 500) are now both consistent with
+  unmodelled per-layer preferred direction.
+- Per-layer preferred direction (Metal1=H, Metal2=V, ...) — the next
+  natural step. Cheapest form: per-axis cost multiplier per layer.
 - Multi-pin net handling (Hazard3 has many; spike was 2-pin only).
+- Per-via-pair `via_cost` (instead of scalar).
 - LEF parsing (only needed when pin coords aren't inferable from Metal1
   patches; `lefdef` on PyPI is macOS-broken, so build-from-source or
   ad-hoc parser are the options).

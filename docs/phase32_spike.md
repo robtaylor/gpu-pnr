@@ -208,32 +208,80 @@ within 7% of TritonRoute on wirelength -- we're 10x cheating on vias
 and the wirelength happens to be close because our tiny grids collapse
 nicely on M1.
 
-A quick test of the hypothesis: artificially set `w[layer=0, ...]` to
-some large penalty (say 50 per cell) to force the router off M1. The
-rest of the cost model stays the same. Predicted outcome: via count
-goes up to TritonRoute-like 2.5/net, wirelength goes up too, ratio
-stabilizes. That's the cheapest experiment worth running before
-committing to a per-direction cost model.
+## M1-as-pin-access experiment (landed)
+
+Hypothesis: applying a large multiplier to Metal1 wire cost forces the
+router to via-stack from each pin up to M2+ for the wire body and back
+down at the sink, approximating gf180mcuD's pin-access-only convention
+for M1 -- and the via count should converge towards TritonRoute's.
+
+`scripts/spike_route_many_nets.py` got an `m1_cost` CLI argument that
+multiplies the cost of every Metal1 wire cell by that factor (applied
+post-`build_grid`, before the route call). Sweep at N=50 nets:
+
+| `m1_cost` | wire ratio | via ratio |
+|---|---|---|
+| 1.0  | 1.07x | 0.15x |
+| 10   | 1.08x | 0.76x |
+| 100  | 1.08x | 0.76x |
+| 1000 | 1.08x | 0.76x |
+
+Saturates at `m1_cost=10`. Beyond that, the router consistently
+via-stacks instead of routing on M1, and adding more penalty doesn't
+change the topology. The wire ratio barely moves (vias add 2 path cells
+per net for the via-stack endpoints, ~+1% aggregate).
+
+Scaled sample with `m1_cost=10`:
+
+| Sample | wire ratio | via ratio |
+|---|---|---|
+| 50  | 1.08x | 0.76x |
+| 200 | 1.26x | 0.78x |
+| 500 | 1.36x | 0.80x |
+
+The via ratio is now stable across sample sizes (~0.78x) instead of
+drifting from 0.15x to 0.06x. The 1.07x->0.78x of-via gap closure is
+the pin-access tax the experiment was designed to surface.
+
+**The remaining ~20% via deficit** (0.78x rather than 1.0x) is the next
+layer of unmodelled constraints. Most likely candidates:
+
+1. **Preferred-direction transitions.** gf180mcuD's M2 prefers vertical,
+   M3 horizontal, M4 vertical, etc. TritonRoute pays one or two extra
+   vias per direction change to keep wire on the correct layer.
+2. **Per-via-pair cost asymmetry.** Real PDKs have different via
+   resistance and DRC for each layer pair (M1-M2 cheaper than M3-M4).
+   Our scalar `via_cost` averages this away.
+3. **Multi-pin Steiner topology.** Our `route_nets_3d` is point-to-point;
+   even 2-pin nets in this comparison are subsets of larger nets in
+   the actual fixture, where TritonRoute's tree may add intermediate
+   layer hops.
+
+The wire ratio (1.08x -> 1.36x with sample size) is probably the same
+preferred-direction story: bigger nets give us more rope to take a
+suboptimal M2-only L-shape where TritonRoute would have gone direct on
+M3 horizontal.
 
 ## Next steps
 
 In rough priority order, post-comparison:
 
-1. **M1-as-pin-access cost model.** Set M1 wire to high cost (~1000),
-   forcing routing onto M2+ except for the via stack. Re-run the
-   comparison; expect wire ratio to converge with TritonRoute's once
-   the via tax is paid honestly.
-2. **Per-layer preferred direction.** M1=H, M2=V, M3=H, ... Either as
-   per-cell direction-cost or via a "wrong direction" multiplier on
-   the wire weight. Needed before the comparison can rank ordering
-   strategies on wirelength alone.
-3. **Multi-pin nets.** Pick from the ~11,000 nets with 3+ Metal1
-   rectangles in the guide. Likely a router-level change (sequential
-   point-to-point construction with re-rooting, or Steiner-tree-flavored
-   heuristic).
-4. **Whole-chip integration.** Replace per-net mini-grids with a single
-   chip-scale grid that tracks committed routes globally. Gates on (1)
-   and (2) and probably tile decomposition (Phase 3.3) to fit at scale.
+1. **Per-layer preferred direction.** Now that the via gap is mostly
+   closed by M1 penalty, the next ~20% of via deficit and the
+   sample-size-dependent wire-ratio drift are both consistent with
+   "we don't know M2 prefers vertical, M3 horizontal." Cheapest
+   model: per-axis cost multiplier per layer (e.g., `axis_cost[layer]
+   = (h_cost, v_cost)`). Slightly bigger surgery: separate H-edge and
+   V-edge costs per cell. Decide based on what the kernel can absorb
+   without breaking the cumsum-cummin trick.
+2. **Multi-pin nets.** ~11,000 of the 24K nets have 3+ Metal1
+   rectangles. Router-level change (sequential point-to-point
+   construction with re-rooting, or Steiner-tree-flavored heuristic).
+3. **Per-via-pair `via_cost`.** Replace the scalar with a length-(L-1)
+   array. Tiny API change, finishes the realism story.
+4. **Whole-chip integration.** Replace per-net mini-grids with a
+   chip-scale grid that tracks committed routes globally. Gates on
+   (1) and probably tile decomposition (Phase 3.3) to fit at scale.
 
 ## Files added
 
