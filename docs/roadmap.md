@@ -113,22 +113,34 @@ at 8.4× speedup vs CPU (Phase 1 was 2.06 ms/iter at 9.5×). The hoist also
 halves per-iter cost at 4096² (67.93 → 31.34 ms/iter) — same Phase 1
 convergence behavior, on a now-correct kernel.
 
-### 3.2 Real-fixture integration (Hazard3 GF180MCU)
+### 3.2 Real-fixture integration (Hazard3 GF180MCU) — SPIKE LANDED
 
-Capture LibreLane GR output for Hazard3 level_3 on gf180mcuD, extract a
-small subblock (~10K nets), convert to the grid + net-list model, route via
-gpu-pnr, compare against OpenROAD/drt's detailed routing on:
-- Total wirelength
-- Via count
-- DRC violation count
-- Wall-clock for the routing stage
+A pre-computed LibreLane run for Hazard3 level_3 on gf180mcuD already exists
+at `~/Code/Apitronix/hazard-test/hazard3/librelane/runs/RUN_2026-05-08_22-32-24/`,
+so the fixture work is parsing-only — no LibreLane execution needed. See
+[phase32_spike.md](phase32_spike.md) for the single-net spike result.
 
-This is the milestone that turns gpu-pnr from a kernel demo into an actual
-ASIC routing experiment. Requires:
-- LibreLane harness script
-- OpenROAD `odb` Python API integration for LEF/DEF/guide parsing
-- 3D / multi-layer extension of the sweep kernel (per-layer sweeps + via cost)
-- Comparison harness
+**What landed:** ad-hoc Python parser for `after_grt.guide`, single-net
+routing pipeline, two real nets routed end-to-end (one trivial M1-only,
+one M1->M2->M3->M2->M1 multi-layer with 4 vias). Distances match
+Manhattan + via_cost exactly. Kernel handles real GR-derived geometry
+without modification.
+
+**Key finding:** the Phase 3.1 module-constant `SEG_BARRIER=2e4` is too
+high for real per-net guides because they have ~93% obstacle density per
+row. Auto-tuning `SEG_BARRIER` from `max(seg_id_per_axis)` is the next
+natural fix and unblocks fixture work at scale.
+
+**Still TODO under 3.2:**
+- Auto-tune `SEG_BARRIER` per call.
+- Comparison harness vs `final/def/synth_top_level_3.def` (TritonRoute output).
+- Multi-pin net handling (Hazard3 has many; spike was 2-pin only).
+- Preferred routing direction (Metal1=H, Metal2=V, ...) — needed for honest
+  wirelength comparison.
+- LEF parsing (only needed when pin coords aren't inferable from Metal1
+  patches; `lefdef` on PyPI is macOS-broken, so build-from-source or
+  ad-hoc parser are the options).
+- DRC compliance.
 
 ### 3.3 Tile decomposition (the path to actual sweep-sharing value)
 
