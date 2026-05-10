@@ -93,6 +93,30 @@ not anything about the kernel.
 ripup-and-reroute (Phase 2.3) are load-bearing for actual success rate,
 not polish on top of reservation.
 
+### Phase 2.2 net ordering: HPWL-ascending is the clean win
+
+Three strategies on the same workload (256², 5% obstacles, seed 42,
+reserve_pins=True):
+
+| nets | identity | hpwl_asc | hpwl_desc |
+|---|---|---|---|
+| 10 | 9/10 | **10/10** | 9/10 |
+| 20 | 11/20 | **18/20** | 12/20 |
+| 30 | 15/30 | **21/30** | 10/30 |
+| 50 | 23/50 | **32/50** | 15/50 |
+| 80 | 26/80 | **41/80** | 25/80 |
+
+HPWL-ascending consistently wins. At 80 nets, success rate goes from
+26 → 41 (+58%). Per-routed-net wirelength also improves: at 50 nets
+identity gives 198 wl/routed-net vs 168 for hpwl_asc.
+
+HPWL-descending is a clean negative result — long nets routed first
+dominate the grid and choke off the short ones. Don't use it.
+
+The ordering change is ~30 lines (`gpu_pnr.ordering`) and adds zero
+algorithmic complexity. This is the kind of low-cost lever that
+sequential routing benefits from.
+
 **The 23/50 success rate** is naive sequential routing on randomly-pre-chosen
 endpoints. Smaller workloads succeed proportionally:
 
