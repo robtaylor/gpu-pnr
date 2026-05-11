@@ -27,6 +27,27 @@ E5 was picked first as the cleanest extension of an established GPU primitive
 Apple Silicon today. E1 is the planned next experiment after E5 reaches a
 real-fixture milestone; it gates on CUDA hardware.
 
+**Open strategic question:** when the CUDA-equipped box is back online, do we
+pivot to E1 (cuOpt MILP) immediately or continue pushing E5 (preferred
+direction, tile decomposition, whole-chip integration) on the same hardware?
+Both are defensible — E1 is a clean second data-point on the same problem; E5
+on CUDA is the cleanest scaling test for the sweep approach. Defer until the
+hardware is actually back; the answer depends partly on how close E5 is to a
+defensible "competitive with TritonRoute" claim at that moment.
+
+### External prior art worth tracking
+
+These are the repos whose work is most directly relevant to E5 and E1. Worth a
+re-read before starting any related implementation.
+
+| Repo | Why it matters |
+|------|----------------|
+| [`cuhk-eda/InstantGR`](https://github.com/cuhk-eda/InstantGR) | Current SOTA GPU global router (ICCAD 2024 / TCAD 2025). Reference for what state-of-the-art GPU routing looks like in 2025. |
+| [`cuhk-eda/Xplace`](https://github.com/cuhk-eda/Xplace) | Where GGR / GAMER live — the sweep primitive this project extends. |
+| [`cuhk-eda/dr-cu`](https://github.com/cuhk-eda/dr-cu), [`limbo018/dr-cu-rl`](https://github.com/limbo018/dr-cu-rl) | CPU detailed routers; the RL fork is relevant to E4. |
+| [`The-OpenROAD-Project/OpenROAD`](https://github.com/The-OpenROAD-Project/OpenROAD) (`src/drt`) | TritonRoute — the detailed-router baseline we compare against. |
+| [`NVIDIA/cuopt`](https://github.com/NVIDIA/cuopt) | The MILP backend for E1, when CUDA hardware returns. |
+
 ## Modules
 
 ### `gpu_pnr.sweep`
