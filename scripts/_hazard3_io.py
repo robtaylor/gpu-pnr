@@ -2,7 +2,7 @@
 
 Used by spike_route_one_net.py and spike_route_many_nets.py. The fixture is the
 pre-computed LibreLane run at ~/Code/Apitronix/hazard-test (see the
-`hazard3_fixture` memory entry); see docs/phase32_spike.md for design notes.
+`hazard3_fixture` memory entry); see docs/spikes/phase32-hazard3-real-fixture.md for design notes.
 """
 
 from __future__ import annotations

@@ -1,45 +1,36 @@
-# gpu-pnr
+# Documentation index
 
-GPU-accelerated place-and-route experiments, targeting the **detailed routing** stage
-of ASIC physical design. Apple Silicon (Metal/MPS) for development; CUDA (cuOpt + custom
-kernels) for production-scale runs once that hardware is available.
+This project follows the [four-document discipline](https://robtaylor.github.io/claude-project-discipline/):
+**ADRs** for why-we-chose-this, **plans** for what's-next, **spikes** for
+did-this-idea-work, **handoffs** for what's-in-flight-right-now (ephemeral).
+See the top-level [`CLAUDE.md`](../CLAUDE.md) for the conventions in detail.
 
-The current active experiment is **E5: sweep-based detailed routing** — extending the
-GAMER sweep primitive (originally global-routing only, CUHK 2021) into the
-detailed-routing regime, with PyTorch MPS as the host.
+## Design narrative
 
-## Repo layout
+- **[architecture.md](architecture.md)** — modules, public APIs, data flow,
+  links to the ADRs that justify the design.
+- **[results.md](results.md)** — measured throughput, scaling, and routing
+  outcomes.
 
-```
-src/gpu_pnr/
-├── sweep.py        sweep-SSSP kernel + naive backtrace (PyTorch, device-agnostic)
-├── baseline.py     reference Dijkstra (CPU) for ground-truth comparison
-└── router.py       sequential multi-net routing on top of sweep
-tests/              pytest suite (correctness vs Dijkstra; multi-net no-overlap)
-scripts/
-├── demo.py             single-net demo with timings
-├── demo_multinet.py    N-net synthetic demo
-└── bench_scaling.py    throughput + speedup across grid sizes
-docs/                this directory
-```
+## Decisions, plans, spikes, handoffs
 
-## Quick start
+- **[adr/](adr/)** — accepted architecture decision records.
+- **[plans/](plans/)** — long-lived plan documents for in-flight workstreams.
+- **[spikes/](spikes/)** — resolved time-boxed investigations.
+- **[handoffs/](handoffs/)** — ephemeral session-bridge notes. Empty when no
+  session has left work mid-flight.
 
-```sh
-uv sync                                    # install deps (torch, numpy, pytest)
-uv run pytest tests/                       # run the test suite
-uv run python scripts/demo.py --size 1024  # single-net demo
-uv run python scripts/bench_scaling.py     # scaling sweep
-```
+## How the discipline works here
 
-## Document index
+Quick reference; full version in [`../CLAUDE.md`](../CLAUDE.md) and
+[`handoff-discipline.md`](handoff-discipline.md):
 
-- **[architecture.md](architecture.md)** — modules, types, key design choices.
-- **[results.md](results.md)** — Phase 1 benchmark findings.
-- **[roadmap.md](roadmap.md)** — E5 origin, what's done, what's next.
-
-## Current status (2026-05-10)
-
-Phase 1 complete: working sweep-SSSP on PyTorch MPS, correctness validated against
-Dijkstra, multi-net sequential routing demonstrated. Peak 9.5× speedup vs CPU
-Dijkstra at 1024². Next: endpoint reservation → net ordering → sweep-sharing.
+- New choice that future-you will need to remember the *why* of → new ADR
+  under [`adr/NNNN-…md`](adr/).
+- Forward-looking work, in-order, with exit criteria → update or add a plan
+  under [`plans/`](plans/).
+- "I want to validate X before committing to ADR Y" → new spike under
+  [`spikes/`](spikes/), time-boxed.
+- Session ends with work in flight → write a handoff under
+  [`handoffs/`](handoffs/) using [`handoffs/_template.md`](handoffs/_template.md);
+  delete it (fold-then-`git rm`) when the work resolves.

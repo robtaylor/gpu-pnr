@@ -69,7 +69,8 @@ def _autotune_seg_barrier(
 ) -> float:
     """Pick SEG_BARRIER from grid shape and obstacle distribution.
 
-    Constraints (see docs/architecture.md and phase32_spike.md):
+    Constraints (see docs/adr/0005-mask-based-segmented-scan.md and
+    docs/spikes/phase32-hazard3-real-fixture.md):
       lower: SEG_BARRIER > 2 * max_legit_distance
         (so polluted-mask threshold = SEG_BARRIER/2 cleanly separates legit
          distances from cross-segment pollution shifted by SEG_BARRIER).

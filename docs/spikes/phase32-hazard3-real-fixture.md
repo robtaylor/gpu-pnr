@@ -1,4 +1,29 @@
-# Phase 3.2 spike — single Hazard3 net, end-to-end
+# Spike — Phase 3.2: does the sweep kernel route real LibreLane geometry end-to-end?
+
+**Status:** Resolved (2026-05-11) — **YES**, with three follow-ons (preferred
+direction, multi-pin nets, per-via-pair via cost) deferred to the
+[Phase 3 plan](../plans/phase3-detailed-routing.md).
+
+## Question
+
+Does `sweep_sssp_3d` / `route_nets_3d` route real LibreLane post-GR geometry
+end-to-end on a real ASIC fixture (Hazard3 on gf180mcuD), and what does its
+output look like vs TritonRoute's?
+
+## Outcome
+
+The kernel routes real geometry without modification — 500/500 sampled small
+2-pin nets route end-to-end at 41–50 ms each. Two design adjustments surfaced
+during the spike and were folded into [ADR 0005](../adr/0005-mask-based-segmented-scan.md)
+(`SEG_BARRIER` per-call autotune, Decision §4) and the M1-cost knob experiment.
+Aggregate via ratio vs TritonRoute closed from 0.15× (no pin-access model) to
+0.78× (`m1_cost=10`); the remaining gap is consistent with unmodelled per-layer
+preferred direction, which is the next slice in the
+[Phase 3 plan](../plans/phase3-detailed-routing.md).
+
+The full narrative below is preserved as the spike record.
+
+## Original notes
 
 This document captures the results of a deliberately-tiny Phase 3.2 spike: take
 one net from a real LibreLane GR run for Hazard3 level_3 on gf180mcuD, build a
@@ -291,6 +316,6 @@ In rough priority order, post-comparison:
   net name and an optional SEG_BARRIER override.
 - `scripts/spike_route_many_nets.py` -- multi-net aggregate-stats driver.
   Includes TritonRoute comparison (wire-length and via count ratios).
-- `docs/phase32_spike.md` -- this document.
+- `docs/spikes/phase32-hazard3-real-fixture.md` -- this document.
 - `~/.claude/projects/-Users-roberttaylor-Code-gpu-pnr/memory/hazard3_fixture.md`
   -- reference memory for the fixture location.

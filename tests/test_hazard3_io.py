@@ -1,7 +1,7 @@
 """Tests for the post-DR DEF NETS-section parser used by the spike scripts.
 
 The parser is hand-rolled (the lefdef PyPI package ships only Linux/Windows
-binaries; see docs/phase32_spike.md). It picks up:
+binaries; see docs/spikes/phase32-hazard3-real-fixture.md). It picks up:
   - wire segments (two coord pairs on one line; sum Manhattan length),
   - vias (single coord + Via* trailing token),
   - `*` placeholders that reuse the previous explicit coord,
@@ -10,7 +10,7 @@ binaries; see docs/phase32_spike.md). It picks up:
     like coords but aren't -- the regex only matches `( int int )`).
 
 These cases are exercised here against a synthetic DEF snippet so the canonical
-hand-traced numbers from docs/phase32_spike.md are locked in.
+hand-traced numbers from docs/spikes/phase32-hazard3-real-fixture.md are locked in.
 """
 
 from __future__ import annotations
